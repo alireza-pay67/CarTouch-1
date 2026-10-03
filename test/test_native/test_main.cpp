@@ -10,6 +10,7 @@
 #include "ct_verify.h"
 #include "ct_password.h"
 #include "ct_storage_policy.h"
+#include "ct_buttons.h"
 #include "ct_json_validation.h"
 #include "ct_battery.h"
 #include "ct_can_config.h"
@@ -761,6 +762,44 @@ void test_sd_cs_pin_validation(void) {
     TEST_ASSERT_FALSE(ctSdCsPinAllowed(49, used, 3));
 }
 
+
+void test_buttons_adc_classification_and_invalid_range(void) {
+    const uint16_t L[5] = {300, 700, 1100, 1500, 1900};
+    TEST_ASSERT_EQUAL_INT(CT_KEY_NONE, ctAdcClassify(4095, L, 100));
+    TEST_ASSERT_EQUAL_INT(CT_KEY_UP, ctAdcClassify(310, L, 100));
+    TEST_ASSERT_EQUAL_INT(CT_KEY_OK, ctAdcClassify(1900, L, 100));
+    TEST_ASSERT_EQUAL_INT(CT_KEY_INVALID, ctAdcClassify(2500, L, 100));
+    TEST_ASSERT_EQUAL_INT(CT_KEY_INVALID, ctAdcClassify(5000, L, 100));
+    const uint16_t overlap[5] = {300, 350, 1100, 1500, 1900};
+    TEST_ASSERT_TRUE(ctLadderValid(L, 100));
+    TEST_ASSERT_FALSE(ctLadderValid(overlap, 100));
+    const int used[] = {10};
+    TEST_ASSERT_TRUE(ctAdcPinAllowed(4, used, 1));
+    TEST_ASSERT_FALSE(ctAdcPinAllowed(12, used, 1));   // ADC2 conflicts with Wi-Fi
+}
+
+void test_buttons_debounce_short_and_long_press(void) {
+    CtKeyState s; uint32_t t = 0; CtKeyEvent e;
+    e = ctKeyStep(s, CT_KEY_UP, t);                      TEST_ASSERT_EQUAL_INT(CT_EV_NONE, e.type);
+    t += 10; e = ctKeyStep(s, CT_KEY_NONE, t);           // bounce
+    t += 10; e = ctKeyStep(s, CT_KEY_UP, t);             TEST_ASSERT_EQUAL_INT(CT_EV_NONE, e.type);
+    t += 40; e = ctKeyStep(s, CT_KEY_UP, t);             TEST_ASSERT_EQUAL_INT(CT_EV_PRESS, e.type);
+    t += 50; e = ctKeyStep(s, CT_KEY_NONE, t);
+    t += 40; e = ctKeyStep(s, CT_KEY_NONE, t);           TEST_ASSERT_EQUAL_INT(CT_EV_SHORT, e.type);
+    t += 100; e = ctKeyStep(s, CT_KEY_OK, t);
+    t += 40; e = ctKeyStep(s, CT_KEY_OK, t);             TEST_ASSERT_EQUAL_INT(CT_EV_PRESS, e.type);
+    t += 900; e = ctKeyStep(s, CT_KEY_OK, t);            TEST_ASSERT_EQUAL_INT(CT_EV_LONG, e.type);
+    t += 10; ctKeyStep(s, CT_KEY_NONE, t);
+    t += 40; e = ctKeyStep(s, CT_KEY_NONE, t);           TEST_ASSERT_EQUAL_INT(CT_EV_NONE, e.type);  // no SHORT after LONG
+}
+
+void test_buttons_invalid_reading_creates_no_event(void) {
+    CtKeyState s;
+    CtKeyEvent e = ctKeyStep(s, CT_KEY_INVALID, 1000);
+    TEST_ASSERT_EQUAL_INT(CT_EV_NONE, e.type);
+    TEST_ASSERT_EQUAL_INT(CT_KEY_NONE, s.stable);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_tx_guard_listen_only);
@@ -817,5 +856,8 @@ int main(int, char**) {
     RUN_TEST(test_storage_policy_auto_prefers_internal_then_sd);
     RUN_TEST(test_storage_policy_explicit_choice_falls_back_and_reports);
     RUN_TEST(test_sd_cs_pin_validation);
+    RUN_TEST(test_buttons_adc_classification_and_invalid_range);
+    RUN_TEST(test_buttons_debounce_short_and_long_press);
+    RUN_TEST(test_buttons_invalid_reading_creates_no_event);
     return UNITY_END();
 }
