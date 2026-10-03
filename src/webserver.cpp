@@ -1804,6 +1804,7 @@ void WebServerManager::_handleAPICanConfig(AsyncWebServerRequest* request) {
     const bool hasCan1ListenOnly = request->hasArg("can1ListenOnly");
     const bool hasObdCanBus = request->hasArg("obdCanBus");
     const bool hasLearnCanBus = request->hasArg("learnCanBus");
+    const bool hasVehicleCanBus = request->hasArg("vehicleCanBus");
     const bool hasAnyCan1 = hasCan1Cs || hasCan1Int || hasCan1Speed || hasCan1ListenOnly;
     const bool hasAllCan1 = hasCan1Cs && hasCan1Int && hasCan1Speed && hasCan1ListenOnly;
     if (hasAnyCan1 && !hasAllCan1) {
@@ -1826,6 +1827,7 @@ void WebServerManager::_handleAPICanConfig(AsyncWebServerRequest* request) {
     bool can1ListenOnly = cfg->can1ListenOnly;
     uint8_t obdCanBus = cfg->obdCanBus;
     uint8_t learnCanBus = cfg->learnCanBus;
+    uint8_t vehicleCanBus = cfg->vehicleCanBus;
 
     const bool can0Valid = ctParseBoundedIndex(txArg.c_str(), 49, tx) &&
                            ctParseBoundedIndex(rxArg.c_str(), 49, rx) &&
@@ -1849,7 +1851,10 @@ void WebServerManager::_handleAPICanConfig(AsyncWebServerRequest* request) {
     const bool learnCanBusValid = !hasLearnCanBus ||
         ctParseBoundedIndex(request->arg("learnCanBus").c_str(), 2, learnCanBus);
 
-    if (!can0Valid || !can1Valid || !obdCanBusValid || !learnCanBusValid ||
+    const bool vehicleCanBusValid = !hasVehicleCanBus ||
+        ctParseBoundedIndex(request->arg("vehicleCanBus").c_str(), 2, vehicleCanBus);
+
+    if (!can0Valid || !can1Valid || !obdCanBusValid || !learnCanBusValid || !vehicleCanBusValid ||
         !validateCanPinAssignment(tx, rx, can1CsPin, can1IntPin)) {
         request->send(400, "application/json", "{\"success\":false,\"error\":\"Invalid or conflicting CAN configuration\"}");
         return;
@@ -1865,6 +1870,7 @@ void WebServerManager::_handleAPICanConfig(AsyncWebServerRequest* request) {
     const bool oldCan1ListenOnly = cfg->can1ListenOnly;
     const uint8_t oldObdCanBus = cfg->obdCanBus;
     const uint8_t oldLearnCanBus = cfg->learnCanBus;
+    const uint8_t oldVehicleCanBus = cfg->vehicleCanBus;
     cfg->canTxPin = tx;
     cfg->canRxPin = rx;
     cfg->canSpeed = speed;
@@ -1875,6 +1881,7 @@ void WebServerManager::_handleAPICanConfig(AsyncWebServerRequest* request) {
     cfg->can1ListenOnly = can1ListenOnly;
     cfg->obdCanBus = obdCanBus;
     cfg->learnCanBus = learnCanBus;
+    cfg->vehicleCanBus = vehicleCanBus;
 
     if (!saveConfig()) {
         cfg->canTxPin = oldTxPin;
@@ -1887,6 +1894,7 @@ void WebServerManager::_handleAPICanConfig(AsyncWebServerRequest* request) {
         cfg->can1ListenOnly = oldCan1ListenOnly;
         cfg->obdCanBus = oldObdCanBus;
         cfg->learnCanBus = oldLearnCanBus;
+        cfg->vehicleCanBus = oldVehicleCanBus;
         request->send(500, "application/json", "{\"success\":false,\"error\":\"Failed to save CAN configuration\"}");
         return;
     }
@@ -1929,6 +1937,7 @@ void WebServerManager::_handleAPIStatus(AsyncWebServerRequest* request) {
     doc["can1ListenOnly"] = cfg->can1ListenOnly;
     doc["obdCanBus"] = cfg->obdCanBus;
     doc["learnCanBus"] = cfg->learnCanBus;
+    doc["vehicleCanBus"] = cfg->vehicleCanBus;
 
     if (_moduleStatus) {
         JsonArray modules = doc["modules"].to<JsonArray>();

@@ -19,6 +19,9 @@
 #include <freertos/semphr.h>
 #include "config.h"
 #include "can_manager.h"
+#include "can_service.h"
+#include "ct_tx_guard.h"
+#include "ct_can_config.h"
 #include "active_profile_manager.h"
 
 // ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
@@ -32,7 +35,12 @@ class VehicleControl {
 // ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
 
 public:
-    VehicleControl(CanInterface& canInterface, ActiveProfileManager& profileManager);
+    VehicleControl(CANService& canService, ActiveProfileManager& profileManager);
+
+    // Channel used for vehicle commands (AppConfig::vehicleCanBus; default CAN1).
+    CanBusId selectedBus() const;
+    // True when the selected channel's configured OR actual mode is Listen-Only.
+    bool isListenOnlyForSelectedBus();
 
     void begin();
 
@@ -102,7 +110,7 @@ public:
 
 private:
     SemaphoreHandle_t       _mutex;    // serializes _execute() across tasks
-    CanInterface&           _can;
+    CANService&             _can;
     ActiveProfileManager&   _profileManager;
     uint8_t                 _lastError;
     String                  _lastErrorMessage;

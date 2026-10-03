@@ -154,7 +154,13 @@ bool loadConfig() {
 
     const bool legacyConfig = err == ESP_OK && configSize == legacyConfigSize;
     const bool priorCan2Config = err == ESP_OK && configSize == priorCan2ConfigSize;
-    const bool priorObdConfig = err == ESP_OK && configSize == priorObdConfigSize;
+    // NOTE: with the current layout priorObdConfigSize == sizeof(AppConfig),
+    // so a size match alone cannot identify an older blob. It is only a
+    // distinct "prior" layout when strictly smaller; otherwise the previously
+    // saved obd/learn bus bytes must be kept (they used to be reset to 0 on
+    // every boot, so a Learn route chosen on CAN2 was lost after reboot).
+    const bool priorObdConfig = err == ESP_OK && configSize == priorObdConfigSize &&
+                                priorObdConfigSize < sizeof(AppConfig);
     if (legacyConfig) {
         currentConfig.can1CsPin = PIN_CAN1_CS;
         currentConfig.can1IntPin = PIN_CAN1_INT;
@@ -166,6 +172,13 @@ bool loadConfig() {
     }
     if (legacyConfig || priorCan2Config || priorObdConfig) {
         currentConfig.learnCanBus = 0;
+    }
+    if (err == ESP_OK) {
+        // Bus-route bytes may sit in old padding: sanitise instead of
+        // discarding the whole configuration (Wi-Fi, password, pins...).
+        currentConfig.obdCanBus     = ctSanitizeBusIndex(currentConfig.obdCanBus);
+        currentConfig.learnCanBus   = ctSanitizeBusIndex(currentConfig.learnCanBus);
+        currentConfig.vehicleCanBus = ctSanitizeBusIndex(currentConfig.vehicleCanBus);
     }
 
     const bool validStoredConfig =
@@ -227,6 +240,27 @@ bool saveConfig() {
 
     Serial.println("[NVS] Save failed");
     return false;
+}
+
+bool isTouchCalibrationSkipped() {
+    nvs_handle_t h;
+    if (nvs_open("CarTouch", NVS_READONLY, &h) != ESP_OK) return false;
+    uint8_t v = 0;
+    esp_err_t err = nvs_get_u8(h, "touch_skip", &v);
+    nvs_close(h);
+    return err == ESP_OK && v != 0;
+}
+
+void setTouchCalibrationSkipped(bool skipped) {
+    nvs_handle_t h;
+    if (nvs_open("CarTouch", NVS_READWRITE, &h) != ESP_OK) {
+        Serial.println("[NVS] Could not store touch skip flag");
+        return;
+    }
+    esp_err_t err = nvs_set_u8(h, "touch_skip", skipped ? 1 : 0);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) Serial.println("[NVS] Touch skip flag save failed");
 }
 
 AppConfig* getConfig() {

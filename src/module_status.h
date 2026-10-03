@@ -15,6 +15,10 @@ enum ModuleId : uint8_t {
     MODULE_STORAGE,
     MODULE_CAN1,
     MODULE_CAN2,
+    // Appended after CAN2: the Web UI refers to module ids by number.
+    MODULE_PSRAM,
+    MODULE_SD,
+    MODULE_BUTTONS,
     MODULE_COUNT
 };
 

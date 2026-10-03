@@ -225,6 +225,11 @@ void TFT_UI::begin() {
         tft.setTouch(cfg->touchCalData);
         _touchAvailable = true;
         Serial.println("[TFT] Applied stored touch calibration");
+    } else if (isTouchCalibrationSkipped()) {
+        // An earlier boot found no responding touch panel. Do not make
+        // every boot wait for it; "Recalibrate Touch" in Settings retries.
+        _touchAvailable = false;
+        Serial.println("[TFT] Touch not detected on an earlier boot - wizard skipped (use Settings > Recalibrate Touch to retry)");
     } else {
         Serial.println("[TFT] No touch calibration found - running first-boot wizard...");
         _touchAvailable = runTouchCalibration();
@@ -342,14 +347,16 @@ bool TFT_UI::runTouchCalibration() {
     esp_task_wdt_reset();
 
     if (!calibrated) {
-        // touchCalibrated stays false in config, so this wizard will run
-        // again on the next boot / from the Settings button once the
-        // touch panel is actually wired up. The rest of the UI still
+        // touchCalibrated stays false in config. The skip flag set below
+        // stops the wizard from delaying every later boot; the Settings
+        // button runs it again once the touch panel is wired up. The rest of the UI still
         // builds and runs fine - it just won't respond to touch yet.
+        setTouchCalibrationSkipped(true);
         tft.fillScreen(TFT_BLACK);
         return false;
     }
 
+    setTouchCalibrationSkipped(false);
     AppConfig* cfg = getConfig();
     memcpy(cfg->touchCalData, s_calibData, sizeof(s_calibData));
     cfg->touchCalibrated = true;

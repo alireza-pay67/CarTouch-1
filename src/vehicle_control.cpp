@@ -21,8 +21,8 @@
 // □□□□□□□□□□ Constructor
 // ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
 
-VehicleControl::VehicleControl(CanInterface& canInterface, ActiveProfileManager& profileManager)
-    : _can(canInterface), _profileManager(profileManager) {
+VehicleControl::VehicleControl(CANService& canService, ActiveProfileManager& profileManager)
+    : _can(canService), _profileManager(profileManager) {
     _mutex              = xSemaphoreCreateRecursiveMutex();
     _lastError          = 0;
     _lastErrorMessage   = "";
@@ -41,11 +41,41 @@ void VehicleControl::begin() {
 // ○○○○○○○○○○ Message dispatch
 // ○○○○○○○○○○○○○○○○○○○○○○○○○○○○○○
 
+CanBusId VehicleControl::selectedBus() const {
+    return ctSanitizeBusIndex(getConfig()->vehicleCanBus) == 1 ? CAN_BUS_2 : CAN_BUS_1;
+}
+
+static bool configListenOnlyFor(CanBusId bus) {
+    const AppConfig* cfg = getConfig();
+    // CAN1 = TWAI (listenOnlyMode); CAN2 = MCP2515 (stored in can1ListenOnly,
+    // an internal name kept for NVS/API compatibility).
+    return bus == CAN_BUS_2 ? cfg->can1ListenOnly : cfg->listenOnlyMode;
+}
+
+bool VehicleControl::isListenOnlyForSelectedBus() {
+    const CanBusId bus = selectedBus();
+    return configListenOnlyFor(bus) || _can.isListenOnlyActive(bus);
+}
+
 bool VehicleControl::_sendResolvedMessage(const CanMessage& msg) {
-    if (getConfig()->listenOnlyMode) {
-        Serial.println("[CTRL] Listen-Only mode active - command not sent");
-        _lastError = 1;
-        _lastErrorMessage = "Listen-Only mode is active";
+    const CanBusId bus = selectedBus();
+    const char* busName = bus == CAN_BUS_2 ? "CAN2" : "CAN1";
+
+    const CtTxGuardResult admission = ctVehicleTxGuard(
+        configListenOnlyFor(bus), _can.isActive(bus),
+        _can.isListenOnlyActive(bus), msg.length);
+    if (admission != CT_TX_OK || !ctTxIdValid(msg.id, msg.isExtended)) {
+        _lastError = admission == CT_TX_ERR_LISTEN_ONLY ? 1 : 2;
+        if (admission == CT_TX_ERR_LISTEN_ONLY) {
+            Serial.printf("[CTRL] %s is in Listen-Only mode - command not sent\n", busName);
+            _lastErrorMessage = "Listen-Only mode is active";
+        } else if (admission == CT_TX_ERR_NOT_INITIALIZED) {
+            Serial.printf("[CTRL] %s is not ready - command not sent\n", busName);
+            _lastErrorMessage = "Selected CAN channel is not ready";
+        } else {
+            Serial.printf("[CTRL] Invalid frame for %s - command not sent\n", busName);
+            _lastErrorMessage = "Invalid CAN frame (ID or length)";
+        }
         return false;
     }
 
@@ -58,8 +88,8 @@ bool VehicleControl::_sendResolvedMessage(const CanMessage& msg) {
     }
     _lastCommandTime = now;
 
-    if (_can.sendMessage(msg)) {
-        Serial.printf("[CTRL] Command sent: ID=0x%03lX, data=", (unsigned long)msg.id);
+    if (_can.sendMessage(bus, msg)) {
+        Serial.printf("[CTRL] Command sent on %s: ID=0x%03lX, data=", busName, (unsigned long)msg.id);
         for (int i = 0; i < msg.length; i++) {
             Serial.printf("%02X ", msg.data[i]);
         }

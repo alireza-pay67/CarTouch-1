@@ -250,6 +250,11 @@ struct AppConfig {
     // Appended so earlier NVS layouts remain migratable.
     uint8_t  obdCanBus       = 0;
     uint8_t  learnCanBus     = 0;
+
+    // Explicit vehicle-command route: 0 = CAN1/TWAI, 1 = CAN2/MCP2515.
+    // Stored in the former trailing padding, so sizeof(AppConfig) and the
+    // NVS blob size do not change; old blobs read 0 (= previous behaviour).
+    uint8_t  vehicleCanBus   = 0;
 };
 
 // ○○○○○○○○○○○○○○○○○○○○○○○○○○○○○○
@@ -267,6 +272,15 @@ AppConfig* getConfig();
 
 /** Resets settings to factory defaults. */
 void setDefaultConfig();
+
+/**
+ * Touch-wizard skip flag (separate NVS key, does not change the AppConfig
+ * blob layout). Set when the touch panel never answered the calibration
+ * wizard, so later boots do not wait for it again. Cleared when a
+ * calibration succeeds or the user starts "Recalibrate Touch" again.
+ */
+bool isTouchCalibrationSkipped();
+void setTouchCalibrationSkipped(bool skipped);
 
 bool isValidCanPin(uint8_t pin);
 bool validateCanPins(uint8_t txPin, uint8_t rxPin);

@@ -40,6 +40,19 @@ static inline bool ctTxIdValid(uint32_t id, bool isExtended) {
     return isExtended ? (id <= 0x1FFFFFFFUL) : (id <= 0x7FFUL);
 }
 
+/**
+ * Admission for vehicle-control frames on an explicitly selected channel.
+ * `configListenOnly` is the persisted setting of THAT channel and
+ * `driverListenOnly` the mode the driver is really running in; either one
+ * blocks transmission (defence in depth: a stale config or a stale driver
+ * state alone can never let a frame out).
+ */
+static inline CtTxGuardResult ctVehicleTxGuard(bool configListenOnly, bool busActive,
+                                               bool driverListenOnly, uint8_t length) {
+    if (configListenOnly) return CT_TX_ERR_LISTEN_ONLY;
+    return ctTxGuard(busActive, driverListenOnly, length);
+}
+
 static inline bool ctSameCanFrameId(uint32_t lhsId, bool lhsExtended,
                                     uint32_t rhsId, bool rhsExtended) {
     return lhsId == rhsId && lhsExtended == rhsExtended;

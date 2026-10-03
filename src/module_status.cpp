@@ -96,6 +96,9 @@ const char* ModuleStatusManager::name(ModuleId id) const {
         case MODULE_STORAGE: return "Storage";
         case MODULE_CAN1: return "CAN1 (TWAI)";
         case MODULE_CAN2: return "CAN2 (MCP2515)";
+        case MODULE_PSRAM: return "PSRAM";
+        case MODULE_SD: return "SD Card";
+        case MODULE_BUTTONS: return "Buttons";
         default: return "Unknown";
     }
 }

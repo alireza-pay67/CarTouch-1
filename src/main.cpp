@@ -643,9 +643,10 @@ void processSerialCommand(const char* command) {
         Serial.printf("CAN2 CS=%u INT=%u bitrate=%lu listenOnly=%s\n",
                       cfg->can1CsPin, cfg->can1IntPin, (unsigned long)cfg->can1Speed,
                       cfg->can1ListenOnly ? "yes" : "no");
-        Serial.printf("OBD channel=CAN%u Learn channel=CAN%u\n",
+        Serial.printf("OBD channel=CAN%u Learn channel=CAN%u Vehicle channel=CAN%u\n",
                       (unsigned)(cfg->obdCanBus + 1u),
-                      (unsigned)(cfg->learnCanBus + 1u));
+                      (unsigned)(cfg->learnCanBus + 1u),
+                      (unsigned)(cfg->vehicleCanBus + 1u));
         return;
     }
 
@@ -894,7 +895,7 @@ void processCommand(const char* command) {
         return;
     }
 
-    if (getConfig()->listenOnlyMode) {
+    if (vehicleControl->isListenOnlyForSelectedBus()) {
         if (strcmp(command, "listen_only") == 0 ||
             strcmp(command, "vehicle_select") == 0 ||
             strncmp(command, "vehicle_select_dbc:", 19) == 0 ||
@@ -949,23 +950,27 @@ void handleControlCommand(const char* command) {
         }
     }
     else if (strcmp(command, "listen_only") == 0) {
-        AppConfig* cfg     = getConfig();
-        bool       newMode = !cfg->listenOnlyMode;
+        // Toggles Listen-Only on the channel selected for vehicle commands.
+        AppConfig*      cfg     = getConfig();
+        const CanBusId  bus     = vehicleControl->selectedBus();
+        const bool      current = (bus == CAN_BUS_2) ? cfg->can1ListenOnly
+                                                     : cfg->listenOnlyMode;
+        const bool      newMode = !current;
 
-        // reconfigureMode() performs a real driver uninstall/reinstall,
-        // so the TWAI driver switches mode immediately.
-        if (!canManager.reconfigureMode(newMode)) {
+        // reconfigureMode() performs a real driver switch on that channel.
+        if (!canManager.reconfigureMode(bus, newMode)) {
             tftUI.showNotification("CAN mode switch failed - please restart the device");
             Serial.println("[CMD] reconfigureMode failed - driver state unknown");
             return;
         }
 
-        cfg->listenOnlyMode = newMode;
+        if (bus == CAN_BUS_2) cfg->can1ListenOnly = newMode;
+        else                  cfg->listenOnlyMode = newMode;
         saveConfig();
-        tftUI.showNotification(cfg->listenOnlyMode ?
-            "Listen-Only mode enabled" : "Normal mode enabled");
-        Serial.printf("[CMD] Listen-Only: %s (driver mode switched)\n",
-                      cfg->listenOnlyMode ? "ON" : "OFF");
+        tftUI.showNotification(newMode ? "Listen-Only mode enabled"
+                                       : "Normal mode enabled");
+        Serial.printf("[CMD] CAN%u Listen-Only: %s (driver mode switched)\n",
+                      bus == CAN_BUS_2 ? 2u : 1u, newMode ? "ON" : "OFF");
         return;
     }
     else if (strcmp(command, "toggle_theme") == 0) {
@@ -1055,7 +1060,13 @@ void refreshModuleStatuses() {
         bleManager.isEnabled() ? MODULE_READY : MODULE_ERROR,
         (filesystemReady && customVehicleStoreReady) ? MODULE_READY : MODULE_ERROR,
         canManager.isActive(CAN_BUS_1) ? MODULE_UNVERIFIED : MODULE_ERROR,
-        canManager.isActive(CAN_BUS_2) ? MODULE_UNVERIFIED : MODULE_ERROR
+        canManager.isActive(CAN_BUS_2) ? MODULE_UNVERIFIED : MODULE_ERROR,
+        // Not every board has PSRAM; its absence is normal, not an error.
+        (ESP.getPsramSize() > 0) ? MODULE_READY : MODULE_NOT_PRESENT,
+        // SD card and physical buttons are not implemented yet: reported as
+        // not present until their drivers exist (they will update these).
+        MODULE_NOT_PRESENT,
+        MODULE_NOT_PRESENT
     };
     bool changed = false;
     for (uint8_t i = 0; i < MODULE_COUNT; ++i) {
