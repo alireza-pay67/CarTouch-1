@@ -625,6 +625,48 @@ void test_verification_transaction_rejections(void) {
     TEST_ASSERT_FALSE(ctVerifyTransactionValid(true, 1, label, 77, 1000, 1, label, 78, 1500, 120000));
     TEST_ASSERT_FALSE(ctVerifyTransactionValid(true, 1, label, 77, 1000, 1, label, 77, 121001, 120000));
 }
+void test_vehicle_tx_guard_blocks_when_config_or_driver_listen_only() {
+    // config says Listen-Only: blocked even if the driver reports Normal
+    TEST_ASSERT_EQUAL(CT_TX_ERR_LISTEN_ONLY, ctVehicleTxGuard(true, true, false, 8));
+    // driver really in Listen-Only: blocked even if config says Normal
+    TEST_ASSERT_EQUAL(CT_TX_ERR_LISTEN_ONLY, ctVehicleTxGuard(false, true, true, 8));
+    // inactive bus is reported as not initialised, never as success
+    TEST_ASSERT_EQUAL(CT_TX_ERR_NOT_INITIALIZED, ctVehicleTxGuard(false, false, false, 8));
+    TEST_ASSERT_EQUAL(CT_TX_ERR_LENGTH, ctVehicleTxGuard(false, true, false, 9));
+    TEST_ASSERT_EQUAL(CT_TX_OK, ctVehicleTxGuard(false, true, false, 8));
+}
+
+void test_bus_route_selector_is_sanitised() {
+    TEST_ASSERT_EQUAL(0, ctSanitizeBusIndex(0));
+    TEST_ASSERT_EQUAL(1, ctSanitizeBusIndex(1));
+    TEST_ASSERT_EQUAL(0, ctSanitizeBusIndex(2));
+    TEST_ASSERT_EQUAL(0, ctSanitizeBusIndex(255));
+}
+
+void test_mcp2515_8mhz_timing_table_decodes_to_requested_bitrates() {
+    // CNF1/CNF2/CNF3 for an 8 MHz crystal. Values are taken from the usual
+    // autowp-mcp2515 table; scripts/check_mcp_timing.py compares them with the
+    // header that is really installed by PlatformIO.
+    struct Row { uint32_t bps; uint8_t c1, c2, c3; uint32_t minSp, maxSp; };
+    const Row rows[] = {
+        {1000000, 0x00, 0x80, 0x80, 700, 800},
+        { 500000, 0x00, 0x90, 0x82, 600, 800},
+        { 250000, 0x00, 0xB1, 0x85, 600, 800},
+        { 125000, 0x01, 0xB1, 0x85, 600, 800},
+        { 100000, 0x01, 0xB4, 0x86, 600, 800},
+    };
+    for (unsigned i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i) {
+        uint32_t bps = 0, sp = 0; uint8_t sjw = 0;
+        TEST_ASSERT_TRUE(ctMcp2515DecodeTiming(8000000UL, rows[i].c1, rows[i].c2,
+                                               rows[i].c3, bps, sp, sjw));
+        TEST_ASSERT_EQUAL(rows[i].bps, bps);
+        TEST_ASSERT_TRUE(sp >= rows[i].minSp && sp <= rows[i].maxSp);
+        TEST_ASSERT_TRUE(sjw >= 1 && sjw <= 4);
+        TEST_ASSERT_TRUE(ctMcp2515BitrateValid(rows[i].bps));
+    }
+    TEST_ASSERT_FALSE(ctMcp2515BitrateValid(800000));   // TWAI-only rate
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_tx_guard_listen_only);
@@ -671,5 +713,8 @@ int main(int, char**) {
     RUN_TEST(test_dbc_extended_id_decode);
     RUN_TEST(test_json_command_validation);
     RUN_TEST(test_json_command_rejects_invalid_types_and_ranges);
+    RUN_TEST(test_vehicle_tx_guard_blocks_when_config_or_driver_listen_only);
+    RUN_TEST(test_bus_route_selector_is_sanitised);
+    RUN_TEST(test_mcp2515_8mhz_timing_table_decodes_to_requested_bitrates);
     return UNITY_END();
 }
