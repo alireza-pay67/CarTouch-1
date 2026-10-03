@@ -103,6 +103,9 @@ jobs:
       - name: Verify only approved modules transmit on CAN
         run: python3 scripts/check_tx_paths.py src
 
+      - name: Audit DBC files (duplicates, duplicate ids)
+        run: python3 scripts/audit_dbc.py
+
       - name: Verify MCP2515 8 MHz bit-timing table
         continue-on-error: true
         run: python3 scripts/check_mcp_timing.py
