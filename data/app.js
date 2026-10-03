@@ -27,6 +27,7 @@ let vehicleData = {};
 let canMonitorActive = false;
 let canMonitorBus = 0;
 let canMonitorLines = [];
+let canRecordingActive = false;
 
 // ○○○○○○○○○○○○○○○○○○○○○○○○○○○○○○
 // ○○○○○○○○○○ DOM references
@@ -93,6 +94,7 @@ async function connectWebSocket() {
         isConnected = false;
         isAuthenticated = false;
         canMonitorActive = false;
+        canRecordingActive = false;
         updateCanMonitorStatus('Stopped (connection closed)');
         connectionStatus.textContent = 'Disconnected';
         connectionStatus.classList.remove('connected');
@@ -160,6 +162,9 @@ function handleMessage(data) {
             connectionStatus.classList.add('connected');
             showNotification('✅ Connected to CarTouch');
             startPing();
+            sendCommand2('can_record_status', {});
+            sendCommand2('obd_dtc_status', {});
+            loadCanRecordings();
             break;
             
         case 'rate_limited':
@@ -195,6 +200,38 @@ function handleMessage(data) {
 
         case 'can_monitor_error':
             updateCanMonitorStatus(data.message || 'Monitor could not start');
+            break;
+
+        case 'can_record_queued':
+            updateCanRecorderStatus({ message: 'Request queued' });
+            break;
+
+        case 'can_record_error':
+            updateCanRecorderStatus({ message: data.message || 'Recording request failed' });
+            break;
+
+        case 'can_record_state': {
+            const wasRecording = canRecordingActive;
+            canRecordingActive = !!data.active;
+            updateCanRecorderStatus(data);
+            if (wasRecording && !canRecordingActive) loadCanRecordings();
+            break;
+        }
+
+        case 'can_record_files_changed':
+            loadCanRecordings();
+            break;
+
+        case 'obd_dtc_queued':
+            updateObdDtcStatus({ message: 'Request queued' });
+            break;
+
+        case 'obd_dtc_error':
+            updateObdDtcStatus({ message: data.message || 'OBD request failed' });
+            break;
+
+        case 'obd_dtc_state':
+            updateObdDtcStatus(data);
             break;
 
         case 'can_frame':
@@ -472,43 +509,161 @@ function setupCanConfigForm(){
       msg.textContent='Server communication error';
       msg.style.color='#e74c3c';
     }
-
-    function updateCanMonitorStatus(text) {
-        const status = document.getElementById('can-monitor-status');
-        if (status) status.textContent = text;
-    }
-
-    function appendCanMonitorFrame(frame) {
-        const output = document.getElementById('can-monitor-frames');
-        if (!output || !frame || typeof frame.id !== 'number' || !Array.isArray(frame.data)) return;
-        const width = frame.extended ? 8 : 3;
-        const id = `0x${frame.id.toString(16).toUpperCase().padStart(width, '0')}`;
-        const bytes = frame.remote ? 'RTR' : frame.data
-            .slice(0, Math.min(8, frame.length))
-            .map(value => Number(value).toString(16).toUpperCase().padStart(2, '0'))
-            .join(' ');
-        const dropped = Number(frame.dropped) || 0;
-        canMonitorLines.push(`${frame.timestamp} ${frame.bus} ${frame.extended ? 'EXT' : 'STD'} ${id} [${frame.length}] ${bytes}${dropped ? ` (dropped: ${dropped})` : ''}`);
-        if (canMonitorLines.length > 100) canMonitorLines.shift();
-        output.textContent = canMonitorLines.join('\n');
-        output.scrollTop = output.scrollHeight;
-        if (dropped) updateCanMonitorStatus(`Listening on ${frame.bus}; ${dropped} frame(s) dropped`);
-    }
-
-    function setupCanMonitor() {
-        const start = document.getElementById('btn-can-monitor-start');
-        const stop = document.getElementById('btn-can-monitor-stop');
-        const bus = document.getElementById('can-monitor-bus');
-        if (!start || !stop || !bus) return;
-        start.addEventListener('click', () => {
-            canMonitorBus = Number(bus.value);
-            canMonitorLines = [];
-            document.getElementById('can-monitor-frames').textContent = '';
-            sendCommand2('can_monitor_start', { bus: canMonitorBus });
-        });
-        stop.addEventListener('click', () => sendCommand2('can_monitor_stop', {}));
-    }
   });
+}
+
+function updateCanMonitorStatus(text) {
+    const status = document.getElementById('can-monitor-status');
+    if (status) status.textContent = text;
+}
+
+function appendCanMonitorFrame(frame) {
+    const output = document.getElementById('can-monitor-frames');
+    if (!output || !frame || typeof frame.id !== 'number' || !Array.isArray(frame.data)) return;
+    const width = frame.extended ? 8 : 3;
+    const id = `0x${frame.id.toString(16).toUpperCase().padStart(width, '0')}`;
+    const bytes = frame.remote ? 'RTR' : frame.data
+        .slice(0, Math.min(8, frame.length))
+        .map(value => Number(value).toString(16).toUpperCase().padStart(2, '0'))
+        .join(' ');
+    const dropped = Number(frame.dropped) || 0;
+    canMonitorLines.push(`${frame.timestamp} ${frame.bus} ${frame.extended ? 'EXT' : 'STD'} ${id} [${frame.length}] ${bytes}${dropped ? ` (dropped: ${dropped})` : ''}`);
+    if (canMonitorLines.length > 100) canMonitorLines.shift();
+    output.textContent = canMonitorLines.join('\n');
+    output.scrollTop = output.scrollHeight;
+    if (dropped) updateCanMonitorStatus(`Listening on ${frame.bus}; ${dropped} frame(s) dropped`);
+}
+
+function setupCanMonitor() {
+    const start = document.getElementById('btn-can-monitor-start');
+    const stop = document.getElementById('btn-can-monitor-stop');
+    const bus = document.getElementById('can-monitor-bus');
+    if (!start || !stop || !bus) return;
+    start.addEventListener('click', () => {
+        canMonitorBus = Number(bus.value);
+        canMonitorLines = [];
+        document.getElementById('can-monitor-frames').textContent = '';
+        sendCommand2('can_monitor_start', { bus: canMonitorBus });
+    });
+    stop.addEventListener('click', () => sendCommand2('can_monitor_stop', {}));
+}
+
+function updateCanRecorderStatus(data) {
+    const status = document.getElementById('can-record-status');
+    const download = document.getElementById('can-record-download');
+    if (!status) return;
+    if (data.message) {
+        status.textContent = data.message;
+        return;
+    }
+    const active = !!data.active;
+    const mask = Number(data.busMask) || 0;
+    const buses = [mask & 1 ? 'CAN1' : '', mask & 2 ? 'CAN2' : ''].filter(Boolean).join(' + ');
+    status.textContent = active
+        ? `Recording ${buses}: ${Number(data.frames) || 0} frames, ${Number(data.dropped) || 0} dropped`
+        : (data.error || `Stopped: ${Number(data.frames) || 0} frames, ${Number(data.dropped) || 0} dropped`);
+    const file = String(data.file || '');
+    if (download && /^\/can\d{4}\.csv$/.test(file)) {
+        download.href = `/api/recordings/download?name=${encodeURIComponent(file.slice(1))}`;
+        download.textContent = `Download ${file.slice(1)}`;
+        download.hidden = false;
+    }
+}
+
+async function loadCanRecordings() {
+    const list = document.getElementById('can-record-files');
+    if (!list) return;
+    try {
+        const response = await fetch('/api/recordings', { credentials: 'same-origin' });
+        if (!response.ok) return;
+        const data = await response.json();
+        const rows = (Array.isArray(data.recordings) ? data.recordings : []).map(recording => {
+            if (!/^can\d{4}\.csv$/.test(recording.name)) return document.createTextNode('');
+            const link = document.createElement('a');
+            link.href = `/api/recordings/download?name=${encodeURIComponent(recording.name)}`;
+            link.textContent = `${recording.name} (${Number(recording.bytes) || 0} bytes)`;
+            link.download = recording.name;
+            const row = document.createElement('p');
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.textContent = 'Delete';
+            remove.addEventListener('click', () => {
+                if (window.confirm(`Delete ${recording.name}? This cannot be undone.`)) {
+                    sendCommand2('can_record_delete', { name: recording.name });
+                }
+            });
+            row.append(link, ' ', remove);
+            return row;
+        });
+        list.replaceChildren(...rows);
+        if (data.truncated) list.append(document.createTextNode('List limited to 50 recordings'));
+    } catch (_) {
+        list.textContent = 'Recording list unavailable';
+    }
+}
+
+function setupCanRecorder() {
+    const bus = document.getElementById('can-record-bus');
+    const start = document.getElementById('btn-can-record-start');
+    const stop = document.getElementById('btn-can-record-stop');
+    if (!bus || !start || !stop) return;
+    start.addEventListener('click', () => sendCommand2('can_record_start', { bus: Number(bus.value) }));
+    stop.addEventListener('click', () => sendCommand2('can_record_stop', {}));
+}
+
+function updateObdDtcStatus(data) {
+    const status = document.getElementById('dtc-status');
+    const list = document.getElementById('dtc-list');
+    const read = document.getElementById('btn-dtc-read');
+    const clear = document.getElementById('btn-dtc-clear');
+    if (!status) return;
+    if (data.message) {
+        status.textContent = data.message;
+        return;
+    }
+
+    const state = Number(data.state);
+    const operation = Number(data.operation);
+    const stateNames = ['Idle', 'Reading DTCs', 'Receiving DTC continuation',
+        'Waiting for ECU clear acknowledgement', 'Complete', 'Failed'];
+    const busy = state >= 1 && state <= 3;
+    if (read) read.disabled = busy;
+    if (clear) clear.disabled = busy;
+    if (state === 5) {
+        const nrc = Number(data.responseCode) || 0;
+        status.textContent = nrc
+            ? `Failed (ECU response code 0x${nrc.toString(16).toUpperCase().padStart(2, '0')})`
+            : `Failed (error ${Number(data.error) || 0})`;
+    } else if (state === 4 && operation === 2) {
+        status.textContent = 'ECU confirmed DTC clear';
+    } else {
+        status.textContent = stateNames[state] || 'Unknown state';
+    }
+
+    if (!list) return;
+    const codes = Array.isArray(data.dtcs) ? data.dtcs : [];
+    list.replaceChildren(...codes.map(code => {
+        const item = document.createElement('li');
+        item.textContent = `0x${Number(code).toString(16).toUpperCase().padStart(4, '0')}`;
+        return item;
+    }));
+    if (state === 4 && operation === 1 && codes.length === 0) {
+        const item = document.createElement('li');
+        item.textContent = 'No stored DTCs';
+        list.append(item);
+    }
+}
+
+function setupObdDtc() {
+    const read = document.getElementById('btn-dtc-read');
+    const clear = document.getElementById('btn-dtc-clear');
+    if (!read || !clear) return;
+    read.addEventListener('click', () => sendCommand2('obd_dtc_read', {}));
+    clear.addEventListener('click', () => {
+        if (window.confirm('Clear stored diagnostic trouble codes from the ECU?')) {
+            sendCommand2('obd_dtc_clear', {});
+        }
+    });
 }
 
 function updateModuleStatusList(modules) {
@@ -551,6 +706,8 @@ document.addEventListener('DOMContentLoaded', function() {
     setupPasswordForm();
     setupCanConfigForm();
     setupCanMonitor();
+    setupCanRecorder();
+    setupObdDtc();
     setupLearnMode();
 });
 

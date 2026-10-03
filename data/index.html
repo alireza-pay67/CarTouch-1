@@ -59,6 +59,15 @@
                     <span class="dash-value" id="dash-fuel">--%</span>
                 </div>
             </div>
+            <div class="settings-group">
+                <h3>DTC Diagnostics</h3>
+                <div class="control-grid">
+                    <button class="ctrl-btn" id="btn-dtc-read">Read DTCs</button>
+                    <button class="ctrl-btn" id="btn-dtc-clear">Clear DTCs</button>
+                </div>
+                <p id="dtc-status" class="muted" aria-live="polite">Idle</p>
+                <ul id="dtc-list" aria-live="polite"></ul>
+            </div>
         </div>
 
         <div id="tab-can-monitor" class="tab-content">
@@ -76,6 +85,21 @@
                 </div>
                 <p id="can-monitor-status" class="muted" aria-live="polite">Stopped</p>
                 <pre id="can-monitor-frames" style="max-height:50vh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#111;padding:10px;border-radius:6px;" aria-live="polite"></pre>
+                <hr>
+                <h3>Persistent CAN Recording</h3>
+                <label for="can-record-bus">Interfaces</label>
+                <select id="can-record-bus" class="learn-select">
+                    <option value="0">CAN1 / TWAI</option>
+                    <option value="1">CAN2 / MCP2515</option>
+                    <option value="2">Both CAN interfaces</option>
+                </select>
+                <div class="control-grid" style="margin-top:8px;">
+                    <button class="ctrl-btn" id="btn-can-record-start">Start recording</button>
+                    <button class="ctrl-btn" id="btn-can-record-stop">Stop recording</button>
+                </div>
+                <p id="can-record-status" class="muted" aria-live="polite">Stopped</p>
+                <a id="can-record-download" hidden download>Download latest recording</a>
+                <div id="can-record-files" aria-live="polite"></div>
             </div>
         </div>
         

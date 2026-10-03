@@ -3,6 +3,8 @@
 
 #include <Arduino.h>
 
+typedef void (*BLECommandCallback)(const char* command);
+
 /**
  * BLE control/status and firmware OTA manager.
  *
@@ -21,6 +23,8 @@ public:
 
     bool begin();
     void update();
+    void setCommandCallback(BLECommandCallback callback);
+    void publishStatus(const char* status);
     bool isEnabled() const;
     bool isConnected() const;
     bool isOtaInProgress() const;
@@ -34,18 +38,27 @@ private:
     bool _otaInProgress;
     bool _otaAuthenticated;
     bool _otaError;
+    bool _commandAuthenticated;
     uint8_t  _otaFailCount = 0;
     uint32_t _otaLockUntil = 0;
+    uint8_t _commandFailCount;
+    uint32_t _commandLockUntil;
+    uint16_t _otaConnHandle;
+    uint16_t _commandConnHandle;
+    bool _hasDeviceCommand;
+    uint32_t _lastDeviceCommandMs;
     uint32_t _otaExpected;
     uint32_t _otaReceived;
     uint32_t _rebootAt;
     String _deviceName;
+    BLECommandCallback _commandCallback;
 
-    void _sendStatus(const char* status);
-    void _handleCommand(const String& command);
-    bool _startOta(uint32_t size, const String& password);
+    void _sendStatus(const char* status, uint16_t connHandle);
+    void _handleCommand(const String& command, uint16_t connHandle);
+    bool _startOta(uint32_t size, const String& password, uint16_t connHandle);
     void _abortOta();
     bool _finishOta();
+    bool _authenticateCommand(const String& password, uint16_t connHandle);
 
     class ServerCallbacks;
     class CommandCallbacks;

@@ -22,6 +22,7 @@
 #include "ct_hex_parser.h"
 #include "ct_index_parser.h"
 #include "ct_battery.h"
+#include "ct_can_record.h"
 
 static bool parseHexUint32(const char* text, uint32_t& value, size_t maxDigits) {
     return ctParseHexUint32(text, value, maxDigits);
@@ -51,6 +52,22 @@ static bool canReplaceFilesystemWithoutCustomProfiles() {
                 if (SPIFFS.exists(prefix + suffix)) return ctFilesystemOtaAllowed(true, true);
             }
         }
+    }
+    File root = SPIFFS.open("/");
+    if (root) {
+        File entry = root.openNextFile();
+        while (entry) {
+            String name = entry.name();
+            if (name.startsWith("/")) name.remove(0, 1);
+            const bool recording = ctCanRecordFilenameValid(name.c_str());
+            entry.close();
+            if (recording) {
+                root.close();
+                return ctFilesystemOtaAllowed(true, true);
+            }
+            entry = root.openNextFile();
+        }
+        root.close();
     }
     return ctFilesystemOtaAllowed(true, false);
 }
@@ -85,7 +102,7 @@ h3{margin:0 0 10px}.muted{opacity:.75;font-size:.9rem}input[type=file]{width:100
 <div class="card"><h3>Firmware Update</h3><p class="muted">Upload a firmware .bin file. Do not power off the device during the update.</p>
 <input type="file" id="f-fw" accept=".bin"><button id="b-fw">Upload and Install Firmware</button>
 <progress id="p-fw" value="0" max="100" hidden></progress><div class="msg" id="m-fw"></div></div>
-<div class="card"><h3>Web Filesystem Update</h3><p class="warn">Filesystem updates are blocked while custom profiles or recovery files exist. Export and remove them before retrying; manually flashing a filesystem image replaces all SPIFFS contents.</p>
+<div class="card"><h3>Web Filesystem Update</h3><p class="warn">Filesystem updates are blocked while custom profiles, recovery files, or CAN recordings exist. Export and remove them before retrying; manually flashing a filesystem image replaces all SPIFFS contents.</p>
 <input type="file" id="f-fs" accept=".bin"><button id="b-fs">Upload and Install Web Files</button>
 <progress id="p-fs" value="0" max="100" hidden></progress><div class="msg" id="m-fs"></div></div>
 <p><a href="/">← Back to CarTouch</a></p>
@@ -557,6 +574,64 @@ void WebServerManager::begin(uint16_t port) {
         }
         request->send(200, "application/json", getErrorLog()->toJSON());
     });
+
+    _server.on("/api/recordings", HTTP_GET, [this](AsyncWebServerRequest* request) {
+        if (!_authenticate(request)) return;
+        File root = SPIFFS.open("/");
+        if (!root) {
+            request->send(503, "application/json", "{\"error\":\"SPIFFS unavailable\"}");
+            return;
+        }
+
+        JsonDocument doc;
+        JsonArray recordings = doc["recordings"].to<JsonArray>();
+        File entry = root.openNextFile();
+        uint8_t count = 0;
+        uint16_t scanned = 0;
+        while (entry && count < 50 && scanned < 200) {
+            ++scanned;
+            String name = entry.name();
+            if (name.startsWith("/")) name.remove(0, 1);
+            if (ctCanRecordFilenameValid(name.c_str())) {
+                JsonObject item = recordings.add<JsonObject>();
+                item["name"] = name;
+                item["bytes"] = entry.size();
+                ++count;
+            }
+            entry.close();
+            entry = root.openNextFile();
+        }
+        const bool truncated = (bool)entry;
+        entry.close();
+        root.close();
+        doc["truncated"] = truncated;
+
+        String json;
+        serializeJson(doc, json);
+        request->send(200, "application/json", json);
+    });
+
+    _server.on("/api/recordings/download", HTTP_GET,
+        [this](AsyncWebServerRequest* request) {
+            if (!_authenticate(request)) return;
+            if (!request->hasParam("name")) {
+                request->send(400, "application/json", "{\"error\":\"Recording name is required\"}");
+                return;
+            }
+            const String name = request->getParam("name")->value();
+            if (!ctCanRecordFilenameValid(name.c_str())) {
+                request->send(400, "application/json", "{\"error\":\"Invalid recording name\"}");
+                return;
+            }
+            const String path = String("/") + name;
+            if (!SPIFFS.exists(path)) {
+                request->send(404, "application/json", "{\"error\":\"Recording not found\"}");
+                return;
+            }
+            AsyncWebServerResponse* response = request->beginResponse(SPIFFS, path, "text/csv");
+            response->addHeader("Content-Disposition", String("attachment; filename=\"") + name + "\"");
+            request->send(response);
+        });
 
     // -- OTA: firmware/filesystem update via browser (behind the same auth) --------
     _server.on("/update", HTTP_GET, [this](AsyncWebServerRequest* request) {
@@ -1512,6 +1587,78 @@ void WebServerManager::_handleWebSocketEvent(AsyncWebSocket* server,
                     auth->canMonitor = false;
                     _syncCanMonitorSubscription();
                     client->printf("{\"type\":\"can_monitor_state\",\"active\":false}");
+                } else if (strcmp(msgType, "can_record_start") == 0) {
+                    uint8_t bus;
+                    if (!_canService || !_commandCallback ||
+                        !parseJsonBoundedIndex(doc["bus"], 3, bus)) {
+                        client->printf("{\"type\":\"can_record_error\",\"message\":\"Invalid recording request\"}");
+                        break;
+                    }
+                    const uint8_t mask = bus == 2 ? 3 : (uint8_t)(1u << bus);
+                    if (((mask & 1u) && !_canService->isActive(CAN_BUS_1)) ||
+                        ((mask & 2u) && !_canService->isActive(CAN_BUS_2))) {
+                        client->printf("{\"type\":\"can_record_error\",\"message\":\"Selected CAN interface is unavailable\"}");
+                        break;
+                    }
+                    const uint32_t now = millis();
+                    if (now - auth->lastCommandTime < COMMAND_RATE_LIMIT_MS) {
+                        client->printf("{\"type\":\"rate_limited\"}");
+                        break;
+                    }
+                    auth->lastCommandTime = now;
+                    char command[24];
+                    snprintf(command, sizeof(command), "record_start:%u", mask);
+                    _commandCallback(command);
+                    client->printf("{\"type\":\"can_record_queued\"}");
+                } else if (strcmp(msgType, "can_record_stop") == 0 ||
+                           strcmp(msgType, "can_record_status") == 0) {
+                    if (!_commandCallback) {
+                        client->printf("{\"type\":\"can_record_error\",\"message\":\"Recording control is unavailable\"}");
+                        break;
+                    }
+                    const uint32_t now = millis();
+                    if (now - auth->lastCommandTime < COMMAND_RATE_LIMIT_MS) {
+                        client->printf("{\"type\":\"rate_limited\"}");
+                        break;
+                    }
+                    auth->lastCommandTime = now;
+                    _commandCallback(strcmp(msgType, "can_record_stop") == 0
+                        ? "record_stop" : "record_status");
+                    client->printf("{\"type\":\"can_record_queued\"}");
+                } else if (strcmp(msgType, "can_record_delete") == 0) {
+                    const char* fileName = doc["name"];
+                    if (!_commandCallback || !ctCanRecordFilenameValid(fileName)) {
+                        client->printf("{\"type\":\"can_record_error\",\"message\":\"Invalid recording filename\"}");
+                        break;
+                    }
+                    const uint32_t now = millis();
+                    if (now - auth->lastCommandTime < COMMAND_RATE_LIMIT_MS) {
+                        client->printf("{\"type\":\"rate_limited\"}");
+                        break;
+                    }
+                    auth->lastCommandTime = now;
+                    char command[32];
+                    snprintf(command, sizeof(command), "record_delete:%s", fileName);
+                    _commandCallback(command);
+                    client->printf("{\"type\":\"can_record_queued\"}");
+                } else if (strcmp(msgType, "obd_dtc_read") == 0 ||
+                           strcmp(msgType, "obd_dtc_clear") == 0 ||
+                           strcmp(msgType, "obd_dtc_status") == 0) {
+                    if (!_commandCallback) {
+                        client->printf("{\"type\":\"obd_dtc_error\",\"message\":\"OBD control is unavailable\"}");
+                        break;
+                    }
+                    if (strcmp(msgType, "obd_dtc_status") != 0) {
+                        const uint32_t now = millis();
+                        if (now - auth->lastCommandTime < COMMAND_RATE_LIMIT_MS) {
+                            client->printf("{\"type\":\"rate_limited\"}");
+                            break;
+                        }
+                        auth->lastCommandTime = now;
+                    }
+                    _commandCallback(strcmp(msgType, "obd_dtc_read") == 0 ? "dtc_read" :
+                        strcmp(msgType, "obd_dtc_clear") == 0 ? "dtc_clear" : "dtc_status");
+                    client->printf("{\"type\":\"obd_dtc_queued\"}");
                 } else if (strncmp(msgType, "learn_", 6) == 0 || strncmp(msgType, "verify_", 7) == 0) {
                     // The same rate limit as regular commands also
                     // applies to verify_command, since that message can
@@ -1869,6 +2016,65 @@ void WebServerManager::broadcastCanDiagnostics(const CanDiagnostics& diagnostics
     doc["txErrorCounter"] = diagnostics.txErrorCounter;
     doc["rxErrorCounter"] = diagnostics.rxErrorCounter;
     doc["msgsWaiting"] = diagnostics.msgsWaiting;
+
+    String json;
+    serializeJson(doc, json);
+    for (AsyncWebSocketClient& client : _ws.getClients()) {
+        WsClientAuth* auth = _findClientAuth(client.id());
+        if (auth && auth->authenticated) client.text(json);
+    }
+}
+
+void WebServerManager::broadcastCanRecordingStatus(bool active, uint8_t busMask,
+                                                    uint32_t frames,
+                                                    uint32_t droppedFrames,
+                                                    const char* fileName,
+                                                    const char* error) {
+    if (!_started) return;
+
+    JsonDocument doc;
+    doc["type"] = "can_record_state";
+    doc["active"] = active;
+    doc["busMask"] = busMask;
+    doc["frames"] = frames;
+    doc["dropped"] = droppedFrames;
+    doc["file"] = fileName ? fileName : "";
+    doc["error"] = error ? error : "";
+
+    String json;
+    serializeJson(doc, json);
+    for (AsyncWebSocketClient& client : _ws.getClients()) {
+        WsClientAuth* auth = _findClientAuth(client.id());
+        if (auth && auth->authenticated) client.text(json);
+    }
+}
+
+void WebServerManager::broadcastCanRecordingFilesChanged() {
+    if (!_started) return;
+    for (AsyncWebSocketClient& client : _ws.getClients()) {
+        WsClientAuth* auth = _findClientAuth(client.id());
+        if (auth && auth->authenticated) {
+            client.printf("{\"type\":\"can_record_files_changed\"}");
+        }
+    }
+}
+
+void WebServerManager::broadcastObdDiagnosticStatus(uint8_t state,
+                                                     uint8_t operation,
+                                                     uint8_t error,
+                                                     uint8_t responseCode,
+                                                     const uint16_t* dtcList,
+                                                     uint8_t dtcCount) {
+    if (!_started) return;
+
+    JsonDocument doc;
+    doc["type"] = "obd_dtc_state";
+    doc["state"] = state;
+    doc["operation"] = operation;
+    doc["error"] = error;
+    doc["responseCode"] = responseCode;
+    JsonArray dtcs = doc["dtcs"].to<JsonArray>();
+    for (uint8_t i = 0; dtcList && i < dtcCount; ++i) dtcs.add(dtcList[i]);
 
     String json;
     serializeJson(doc, json);

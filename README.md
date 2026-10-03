@@ -58,7 +58,7 @@
 </tr>
 <tr>
 <td align="center">🔎 <b>CAN Monitor</b></td>
-<td align="center">نمایش فریم‌های CAN در Web UI احراز‌شده، با صف‌های دریافت مستقل و خروجی محدودشده؛ این قابلیت فقط شنود می‌کند و هیچ فریمی ارسال نمی‌کند. Recorder و log/replay هنوز ارائه نشده‌اند</td>
+<td align="center">نمایش و ضبط شنودی CAN1، CAN2 یا هر دو در Web UI احراز‌شده؛ حداکثر 100 فایل CSV با سقف 256KiB برای هر فایل در SPIFFS، فهرست/دانلود/حذف، شمارش frame drop و توقف امن. Timestamp برحسب میلی‌ثانیه از uptime است؛ replay و import ارائه نشده‌اند</td>
 </tr>
 <tr>
 <td align="center">🎓 <b>یادگیری</b></td>
@@ -82,7 +82,7 @@
 </tr>
 <tr>
 <td align="center">🔌 <b>USB Serial</b></td>
-<td align="center">کنسول headless برای status/config/CAN/OBD/Learn/storage/errors؛ فرمان‌های کنترل فقط از مسیر guarded موجود عبور می‌کنند</td>
+<td align="center">کنسول headless برای status/config/CAN/OBD/Learn/storage/errors و شروع/توقف/فهرست وضعیت ضبط؛ فرمان‌های کنترل فقط از مسیر guarded موجود عبور می‌کنند</td>
 </tr>
 <tr>
 <td align="center">🔋 <b>انرژی</b></td>
@@ -90,7 +90,7 @@
 </tr>
 <tr>
 <td align="center">⬆️ <b>به‌روزرسانی</b></td>
-<td align="center">OTA برای firmware و filesystem از طریق وب (پس از احراز هویت) و BLE OTA با رمز</td>
+<td align="center">OTA firmware/filesystem از طریق Web احراز‌شده و BLE با رمز؛ BLE همچنین DTC و Recorder را با AUTH، session متصل به connection و همان صف فرمان مشترک ارائه می‌دهد، اما جایگزین کامل Web UI نیست</td>
 </tr>
 <tr>
 <td align="center">⚙️ <b>تنظیمات CAN</b></td>
@@ -111,7 +111,7 @@
 </tr>
 <tr>
 <td align="center">خواندن OBD-II</td>
-<td align="center">✅ PIDهای polling در Single Frame؛ خواندن DTC از Single/Multi-Frame با کنترل sequence/Flow Control؛ کانال از وب انتخاب می‌شود و TX fallback خودکار وجود ندارد. ISO-TP عمومی پشتیبانی نمی‌شود</td>
+<td align="center">✅ polling PIDها در Single Frame؛ DTC Mode 03 با state machine غیرمسدودکننده و پشتیبانی Single/First/Consecutive Frame و Flow Control؛ پاک‌کردن Mode 04 فقط پس از تأیید ECU. کانال OBD مستقل است و TX fallback خودکار وجود ندارد؛ ISO-TP عمومی برای سرویس‌های دلخواه هنوز پشتیبانی نمی‌شود</td>
 </tr>
 <tr>
 <td align="center">ولتاژ ECU</td>
@@ -119,7 +119,7 @@
 </tr>
 <tr>
 <td align="center">DTC</td>
-<td align="center">⚠️ در لایه‌ی OBD وجود دارد، اما UI برای نمایش/مدیریت آن در Web/TFT ارائه نشده است</td>
+<td align="center">✅ خواندن و پاک‌کردن در Dashboard وب و USB Serial؛ نمایش NRC و فهرست کدها. نتیجه‌ی فیزیکی فقط با ECU سازگار قابل تأیید است</td>
 </tr>
 <tr>
 <td align="center">Learn Mode</td>
@@ -306,14 +306,14 @@ pio run -e esp32-s3-devkitc-1 -t uploadfs     # آپلود filesystem (وب و D
 pio device monitor                            # مانیتور سریال
 ```
 
-<p class="markdown-alert markdown-alert-warning" dir="rtl"><b>هشدار:</b> فرمان دستی <code>uploadfs</code> کل SPIFFS را جایگزین می‌کند و می‌تواند پروفایل‌های یادگرفته‌شده را پاک کند. پیش از اجرای آن از پروفایل‌ها export و backup بگیرید؛ محافظ OTA وب مانع جایگزینی filesystem هنگام وجود فایل‌های پروفایل می‌شود.</p>
+<p class="markdown-alert markdown-alert-warning" dir="rtl"><b>هشدار:</b> فرمان دستی <code>uploadfs</code> کل SPIFFS را جایگزین می‌کند و می‌تواند پروفایل‌های یادگرفته‌شده و ضبط‌های CAN را پاک کند. پیش از اجرای آن از داده‌ها export و backup بگیرید؛ محافظ OTA وب تا وقتی فایل پروفایل یا ضبط CAN وجود دارد، جایگزینی filesystem را رد می‌کند.</p>
 
 <div class="markdown-alert markdown-alert-warning" dir="rtl">
 <p class="markdown-alert-title">محدودیت پیکربندی حافظه</p>
 <p>پروفایل اصلی <code>esp32-s3-devkitc-1</code> از برد N16R8 با فلش 16MB و PSRAM نوع OPI استفاده می‌کند. پروفایل‌های <code>esp32-s3-4mb</code> و <code>esp32-s3-4mb-psram</code> جدول واقعی 4MB و filesystem کوچک‌شده دارند؛ دومی برای PSRAM نوع QSPI است. firmware فعلی در هر دو پروفایل نزدیک به سقف 1.5MB هر OTA slot است، بنابراین تغییرات بزرگ بعدی ممکن است به جدول پارتیشن تازه نیاز داشته باشد.</p>
 </div>
 
-<p>در پروفایل 4MB فقط Web UI و 10 فایل DBC منطقه‌ای/وارداتی منتخب بسته‌بندی می‌شوند؛ مجموعه‌ی کامل 57 فایل در <code>data/dbc</code> دست‌نخورده می‌ماند و برای پروفایل 16MB است. فهرست خودرو در زمان اجرا فقط DBCهای موجود در filesystem را نشان می‌دهد. پروفایل‌های فعلی همچنان SPIFFS-only هستند و درایور عمومی SD، تنظیم پین‌های نمایشگر در زمان اجرا و پشتیبانی از کنترلرهای TFT دیگر هنوز پیاده‌سازی نشده‌اند.</p>
+<p>در پروفایل 4MB فقط Web UI و 10 فایل DBC منطقه‌ای/وارداتی منتخب بسته‌بندی می‌شوند؛ مجموعه‌ی کامل 57 فایل در <code>data/dbc</code> دست‌نخورده می‌ماند و برای پروفایل 16MB است. فهرست خودرو در زمان اجرا فقط DBCهای موجود در filesystem را نشان می‌دهد. پروفایل‌های فعلی SPIFFS-only هستند؛ backend کارت SD و Five-way پیاده‌سازی نشده‌اند، چون رابط/پین معتبر SD و روش GPIO یا ADC و پین‌های Five-way در مرجع سخت‌افزاری این مخزن مشخص نشده‌اند. تنظیم پین نمایشگر در زمان اجرا و کنترلرهای TFT غیر از ILI9341 نیز پشتیبانی نمی‌شوند.</p>
 
 <p>پروفایل <code>esp32-s3-headless</code> نمایشگر، تاچ و بافرهای LVGL را init/رزرو نمی‌کند؛ دسترسی شبکه و BLE مستقل می‌ماند و از جدول 16MB استفاده می‌کند. همه‌ی پروفایل‌های نمایش‌دار فعلی روی پین‌بندی ثابت ILI9341/XPT2046 در <code>platformio.ini</code> تنظیم شده‌اند.</p>
 

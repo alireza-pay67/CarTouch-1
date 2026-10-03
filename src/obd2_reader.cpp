@@ -39,6 +39,15 @@ OBD2Reader::OBD2Reader(CANService& canService)
     _hasCompletedRound   = false;
     _pollIntervalMs       = 200;            // Spacing between completed rounds
     _lastRoundStartMs      = 0;
+    _diagnosticState = OBD_DIAG_IDLE;
+    _diagnosticOperation = OBD_DIAG_OP_NONE;
+    _diagnosticStartMs = 0;
+    _diagnosticError = 0;
+    _diagnosticResponseCode = 0;
+    _dtcCount = 0;
+    memset(_dtcList, 0, sizeof(_dtcList));
+    memset(_dtcPayload, 0, sizeof(_dtcPayload));
+    memset(&_dtcReassembly, 0, sizeof(_dtcReassembly));
 }
 
 bool OBD2Reader::setCanBus(CanBusId bus) {
@@ -385,6 +394,11 @@ void OBD2Reader::_pollCheckResponse() {
 }
 
 void OBD2Reader::update() {
+    if (isDiagnosticBusy()) {
+        _updateDiagnostic();
+        return;
+    }
+
     uint32_t now = millis();
 
     switch (_pollState) {
@@ -436,6 +450,161 @@ bool OBD2Reader::getLatestData(VehicleData& outData) {
 
 ObdPollState OBD2Reader::getPollState() {
     return _pollState;
+}
+
+bool OBD2Reader::isDiagnosticBusy() const {
+    return _diagnosticState == OBD_DIAG_READ_WAITING ||
+           _diagnosticState == OBD_DIAG_READ_CONSECUTIVE ||
+           _diagnosticState == OBD_DIAG_CLEAR_WAITING;
+}
+
+bool OBD2Reader::_startDiagnosticRequest(uint8_t service,
+                                         ObdDiagnosticOperation operation) {
+    if (isDiagnosticBusy()) return false;
+
+    _diagnosticOperation = operation;
+    _diagnosticError = 0;
+    _diagnosticResponseCode = 0;
+    _dtcCount = 0;
+    _lastError = 0;
+    _pollState = OBD_POLL_IDLE;
+
+    if (!canTransmit()) {
+        _diagnosticError = _lastError = 1;
+        _diagnosticState = OBD_DIAG_FAILED;
+        return false;
+    }
+
+    _can.flushRx(_bus, CAN_RX_OBD);
+    CanMessage request = {};
+    request.id = OBD_REQUEST_ID;
+    request.length = 8;
+    request.data[0] = 0x01;
+    request.data[1] = service;
+    if (!_can.sendMessage(_bus, request)) {
+        _diagnosticError = _lastError = 1;
+        _diagnosticState = OBD_DIAG_FAILED;
+        return false;
+    }
+
+    _diagnosticStartMs = millis();
+    _diagnosticState = operation == OBD_DIAG_OP_READ_DTCS
+        ? OBD_DIAG_READ_WAITING : OBD_DIAG_CLEAR_WAITING;
+    return true;
+}
+
+bool OBD2Reader::startDtcRead() {
+    return _startDiagnosticRequest(OBD_MODE_DTC, OBD_DIAG_OP_READ_DTCS);
+}
+
+bool OBD2Reader::startDtcClear() {
+    return _startDiagnosticRequest(OBD_MODE_CLEAR_DTC, OBD_DIAG_OP_CLEAR_DTCS);
+}
+
+void OBD2Reader::_finishDtcRead(const uint8_t* payload, uint16_t length) {
+    if (!ctParseObdDtcPayload(payload, length, _dtcList,
+                              MAX_DTC_COUNT, _dtcCount)) {
+        _diagnosticError = _lastError = 3;
+        _diagnosticState = OBD_DIAG_FAILED;
+        return;
+    }
+    _diagnosticError = _lastError = 0;
+    _diagnosticState = OBD_DIAG_COMPLETE;
+}
+
+void OBD2Reader::_updateDiagnostic() {
+    if (!isDiagnosticBusy()) return;
+    if (!canTransmit()) {
+        _diagnosticError = _lastError = 1;
+        _diagnosticState = OBD_DIAG_FAILED;
+        return;
+    }
+    if (ctElapsedAtLeast(millis(), _diagnosticStartMs, 1000)) {
+        _diagnosticError = _lastError = 2;
+        _diagnosticState = OBD_DIAG_FAILED;
+        return;
+    }
+
+    for (uint8_t count = 0; count < 32; ++count) {
+        CanRxFrame rxFrame = {};
+        if (!_can.receiveRx(_bus, CAN_RX_OBD, rxFrame)) break;
+        const CanMessage& reply = rxFrame.message;
+        if (!ctIsObdReplyFrame(reply.id, reply.isExtended, reply.isRemote) ||
+            reply.length == 0) continue;
+
+        if (_diagnosticState == OBD_DIAG_CLEAR_WAITING) {
+            if (ctParseObdPositiveServiceAck(reply.data, reply.length, 0x44)) {
+                _diagnosticError = _lastError = 0;
+                _diagnosticState = OBD_DIAG_COMPLETE;
+                return;
+            }
+            uint8_t responseCode = 0;
+            if (ctParseObdNegativeResponse(reply.data, reply.length,
+                                           OBD_MODE_CLEAR_DTC, responseCode)) {
+                _diagnosticResponseCode = responseCode;
+                _diagnosticError = _lastError = 3;
+                _diagnosticState = OBD_DIAG_FAILED;
+                return;
+            }
+            continue;
+        }
+
+        if (_diagnosticState == OBD_DIAG_READ_CONSECUTIVE) {
+            if (reply.id != _dtcReassembly.canId ||
+                reply.isExtended != _dtcReassembly.isExtended) continue;
+            if (!ctIsoTpAppend(reply.data, reply.length, reply.id,
+                               reply.isExtended, _dtcPayload, _dtcReassembly)) {
+                _diagnosticError = _lastError = 3;
+                _diagnosticState = OBD_DIAG_FAILED;
+                return;
+            }
+            if (ctIsoTpComplete(_dtcReassembly)) {
+                _finishDtcRead(_dtcPayload, _dtcReassembly.totalLength);
+                return;
+            }
+            continue;
+        }
+
+        const uint8_t frameType = (uint8_t)(reply.data[0] & 0xF0u);
+        if (frameType == 0x00u) {
+            CtObdSingleFrame parsed;
+            if (ctParseObdSingleFrame(reply.data, reply.length, 0x43, 0xFF, parsed)) {
+                _finishDtcRead(reply.data + 1, parsed.payloadLength);
+                return;
+            }
+            uint8_t responseCode = 0;
+            if (ctParseObdNegativeResponse(reply.data, reply.length,
+                                           OBD_MODE_DTC, responseCode)) {
+                _diagnosticResponseCode = responseCode;
+                _diagnosticError = _lastError = 3;
+                _diagnosticState = OBD_DIAG_FAILED;
+                return;
+            }
+            continue;
+        }
+
+        if (frameType != 0x10u) continue;
+        memset(_dtcPayload, 0, sizeof(_dtcPayload));
+        if (!ctIsoTpBegin(reply.data, reply.length, reply.id, reply.isExtended,
+                          _dtcPayload, sizeof(_dtcPayload), _dtcReassembly) ||
+            _dtcPayload[0] != 0x43u) {
+            _diagnosticError = _lastError = 3;
+            _diagnosticState = OBD_DIAG_FAILED;
+            return;
+        }
+
+        CanMessage flowControl = {};
+        flowControl.id = reply.id - 8u;
+        flowControl.length = 8;
+        if (!ctBuildIsoTpFlowControl(flowControl.data, sizeof(flowControl.data),
+                                     0, 0, 0) ||
+            !_can.sendMessage(_bus, flowControl)) {
+            _diagnosticError = _lastError = 1;
+            _diagnosticState = OBD_DIAG_FAILED;
+            return;
+        }
+        _diagnosticState = OBD_DIAG_READ_CONSECUTIVE;
+    }
 }
 
 // ○○○○○○○○○○○○○○○○○○○○○○○○○○○○○○
@@ -528,9 +697,11 @@ uint8_t OBD2Reader::readDTCs(uint16_t dtcList[], uint8_t maxCount) {
         CanMessage flowControl = {};
         flowControl.id = reply.id - 8u;
         flowControl.length = 8;
-        flowControl.data[0] = 0x30; // Continue To Send
-        flowControl.data[1] = 0;    // No block limit
-        flowControl.data[2] = 0;    // Minimum separation time
+        if (!ctBuildIsoTpFlowControl(flowControl.data, sizeof(flowControl.data),
+                                     0, 0, 0)) {
+            _lastError = 3;
+            return 0;
+        }
         if (!_can.sendMessage(_bus, flowControl)) {
             _lastError = 1;
             return 0;
@@ -561,17 +732,13 @@ uint8_t OBD2Reader::readDTCs(uint16_t dtcList[], uint8_t maxCount) {
         break;
     }
 
-    if (!complete || payloadLength < 1 || payload[0] != 0x43u ||
-        !ctDtcPayloadHasValidPairLength((uint8_t)payloadLength)) {
+    uint8_t dtcCount = 0;
+    if (!complete || !ctParseObdDtcPayload(payload, payloadLength, dtcList,
+                                          maxCount, dtcCount)) {
         _lastError = complete ? 3 : 2;
         return 0;
     }
 
-    uint8_t dtcCount = 0;
-    for (uint16_t i = 1; i + 1u < payloadLength && dtcCount < maxCount; i += 2) {
-        const uint16_t dtc = (uint16_t)(((uint16_t)payload[i] << 8) | payload[i + 1]);
-        if (dtc != 0) dtcList[dtcCount++] = dtc;
-    }
     _lastError = 0;
     return dtcCount;
 }
@@ -591,7 +758,34 @@ bool OBD2Reader::clearDTCs() {
     request.data[6]     = 0x00;
     request.data[7]     = 0x00;
 
-    return _can.sendMessage(_bus, request);
+    if (!_can.sendMessage(_bus, request)) {
+        _lastError = 1;
+        return false;
+    }
+
+    const uint32_t startMs = millis();
+    bool receivedNegativeResponse = false;
+    while (!ctElapsedAtLeast(millis(), startMs, 500)) {
+        CanMessage reply = {};
+        if (!receiveObdFrame(_can, _bus, reply, 25) ||
+            !ctIsObdReplyFrame(reply.id, reply.isExtended, reply.isRemote)) {
+            continue;
+        }
+
+        if (ctParseObdPositiveServiceAck(reply.data, reply.length, 0x44)) {
+            _lastError = 0;
+            return true;
+        }
+
+        uint8_t responseCode = 0;
+        if (ctParseObdNegativeResponse(reply.data, reply.length, OBD_MODE_CLEAR_DTC,
+                                       responseCode)) {
+            receivedNegativeResponse = true;
+        }
+    }
+
+    _lastError = receivedNegativeResponse ? 3 : 2;
+    return false;
 }
 
 uint8_t OBD2Reader::getLastError() {
