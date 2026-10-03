@@ -667,6 +667,32 @@ void test_mcp2515_8mhz_timing_table_decodes_to_requested_bitrates() {
     TEST_ASSERT_FALSE(ctMcp2515BitrateValid(800000));   // TWAI-only rate
 }
 
+void test_can_link_state_requires_real_traffic() {
+    const uint32_t T = 5000;
+    // driver stopped / bus-off are never "connected"
+    TEST_ASSERT_EQUAL(CT_LINK_DOWN,    ctCanLinkState(false, false, 1000, 2000, T));
+    TEST_ASSERT_EQUAL(CT_LINK_BUS_OFF, ctCanLinkState(true,  true,  1000, 2000, T));
+    TEST_ASSERT_EQUAL(CT_LINK_BUS_OFF, ctCanLinkState(false, true,  1000, 2000, T));
+    // started but never received a frame: NOT connected
+    TEST_ASSERT_EQUAL(CT_LINK_NO_TRAFFIC, ctCanLinkState(true, false, 0, 2000, T));
+    // recent frame: connected; stale frame: back to no traffic
+    TEST_ASSERT_EQUAL(CT_LINK_TRAFFIC,    ctCanLinkState(true, false, 1000, 6000, T));
+    TEST_ASSERT_EQUAL(CT_LINK_NO_TRAFFIC, ctCanLinkState(true, false, 1000, 6001, T));
+    // millis() wrap-around keeps working
+    TEST_ASSERT_EQUAL(CT_LINK_TRAFFIC,    ctCanLinkState(true, false, 0xFFFFFF00u, 0x00000100u, T));
+}
+
+void test_bus_off_recovery_schedule() {
+    // first attempt is immediate
+    TEST_ASSERT_TRUE(ctRecoveryDue(false, 0, 100, 5000));
+    // then at most one attempt per retry interval
+    TEST_ASSERT_FALSE(ctRecoveryDue(true, 1000, 5999, 5000));
+    TEST_ASSERT_TRUE(ctRecoveryDue(true, 1000, 6000, 5000));
+    // wrap-safe
+    TEST_ASSERT_FALSE(ctRecoveryDue(true, 0xFFFFFF00u, 0x00000100u, 5000));
+    TEST_ASSERT_TRUE(ctRecoveryDue(true, 0xFFFFF000u, 0x00001000u, 5000));
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_tx_guard_listen_only);
@@ -716,5 +742,7 @@ int main(int, char**) {
     RUN_TEST(test_vehicle_tx_guard_blocks_when_config_or_driver_listen_only);
     RUN_TEST(test_bus_route_selector_is_sanitised);
     RUN_TEST(test_mcp2515_8mhz_timing_table_decodes_to_requested_bitrates);
+    RUN_TEST(test_can_link_state_requires_real_traffic);
+    RUN_TEST(test_bus_off_recovery_schedule);
     return UNITY_END();
 }
