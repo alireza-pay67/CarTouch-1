@@ -6,6 +6,8 @@
  */
 
 #include "config.h"
+#include "ct_password.h"
+#include <esp_random.h>
 #include "ct_can_config.h"
 #include <nvs_flash.h>
 #include <nvs.h>
@@ -99,7 +101,9 @@ static void applyDefaultConfigValues() {
     strcpy(currentConfig.wifiPassword, "");
     currentConfig.wifiEnabled = true;
     strcpy(currentConfig.webUser, WEB_DEFAULT_USER);
-    strcpy(currentConfig.webPass, WEB_DEFAULT_PASS);
+    // Per-device random password instead of one shared constant. It is
+    // printed on Serial at boot while forcePasswordChange is set.
+    ctGeneratePassword(currentConfig.webPass, sizeof(currentConfig.webPass), esp_random);
     currentConfig.forcePasswordChange = true;
     strcpy(currentConfig.vehicleBrand, "Generic");
     strcpy(currentConfig.vehicleModel, "OBD-II");
@@ -211,6 +215,10 @@ bool loadConfig() {
     currentConfig.vehicleBrand[sizeof(currentConfig.vehicleBrand) - 1] = '\0';
     currentConfig.vehicleModel[sizeof(currentConfig.vehicleModel) - 1] = '\0';
 
+    if (currentConfig.forcePasswordChange) {
+        Serial.printf("[SECURITY] Web login: user '%s', temporary password '%s' (change it on first login)\n",
+                      currentConfig.webUser, currentConfig.webPass);
+    }
     configLoaded = true;
     Serial.println(validStoredConfig ? "[NVS] Configuration loaded" : "[NVS] Default configuration loaded");
     return true;

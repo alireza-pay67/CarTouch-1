@@ -18,6 +18,7 @@
 #include <SPIFFS.h>
 #include <esp_random.h>
 #include <Update.h>
+#include "ct_password.h"
 
 #include "ct_hex_parser.h"
 #include "ct_index_parser.h"
@@ -1076,6 +1077,13 @@ void WebServerManager::_handleOtaUpload(AsyncWebServerRequest* request, const St
     }
 
     if (_otaError.length() > 0) return;
+
+    // First chunk of a firmware image must start with the ESP image magic.
+    if (index == 0 && !_otaIsFs && !ctOtaFirmwareHeaderOk(data, len)) {
+        _otaError = "Not a valid ESP32 firmware image (bad header)";
+        if (Update.isRunning()) Update.abort();
+        return;
+    }
 
     if (len > 0) {
         if (Update.write(data, len) != len) {
