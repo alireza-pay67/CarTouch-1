@@ -20,6 +20,7 @@ enum CanRxConsumer : uint8_t {
     CAN_RX_LEARN,
     CAN_RX_MONITOR,
     CAN_RX_WAKE,
+    CAN_RX_RECORDER,
     CAN_RX_CONSUMER_COUNT
 };
 

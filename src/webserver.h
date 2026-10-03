@@ -104,6 +104,13 @@ public:
     void broadcastStatus(const char* status);
     void broadcastCanDiagnostics(const CanDiagnostics& diagnostics,
                                  const char* interfaceName = "CAN1");
+    void broadcastCanRecordingStatus(bool active, uint8_t busMask,
+                                     uint32_t frames, uint32_t droppedFrames,
+                                     const char* fileName, const char* error);
+    void broadcastCanRecordingFilesChanged();
+    void broadcastObdDiagnosticStatus(uint8_t state, uint8_t operation,
+                                      uint8_t error, uint8_t responseCode,
+                                      const uint16_t* dtcList, uint8_t dtcCount);
     void broadcastModuleStatus();
     bool isClientConnected();
     bool isStarted() const { return _started; }

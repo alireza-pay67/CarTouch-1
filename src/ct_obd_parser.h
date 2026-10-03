@@ -94,6 +94,53 @@ static inline bool ctParseObdSingleFrame(const uint8_t* frame, uint8_t dlc,
     return true;
 }
 
+static inline bool ctParseObdPositiveServiceAck(const uint8_t* frame,
+                                                uint8_t dlc,
+                                                uint8_t expectedService) {
+    return frame && dlc >= 2 && frame[0] == 0x01u &&
+           frame[1] == expectedService;
+}
+
+static inline bool ctParseObdNegativeResponse(const uint8_t* frame,
+                                              uint8_t dlc,
+                                              uint8_t requestedService,
+                                              uint8_t& responseCode) {
+    if (!frame || dlc < 4 || frame[0] != 0x03u || frame[1] != 0x7Fu ||
+        frame[2] != requestedService) return false;
+    responseCode = frame[3];
+    return true;
+}
+
+static inline bool ctParseObdDtcPayload(const uint8_t* payload,
+                                        uint16_t payloadLength,
+                                        uint16_t* dtcList,
+                                        uint8_t maxCount,
+                                        uint8_t& dtcCount) {
+    dtcCount = 0;
+    if (!payload || !dtcList || maxCount == 0 || payloadLength < 1 ||
+        payload[0] != 0x43u || ((payloadLength - 1u) % 2u) != 0u) return false;
+
+    for (uint16_t i = 1; i + 1u < payloadLength && dtcCount < maxCount; i += 2) {
+        const uint16_t dtc = (uint16_t)(((uint16_t)payload[i] << 8) | payload[i + 1]);
+        if (dtc != 0) dtcList[dtcCount++] = dtc;
+    }
+    return true;
+}
+
+static inline bool ctBuildIsoTpFlowControl(uint8_t* frame, uint8_t capacity,
+                                           uint8_t flowStatus,
+                                           uint8_t blockSize,
+                                           uint8_t separationTime) {
+    const bool validSeparationTime = separationTime <= 0x7Fu ||
+        (separationTime >= 0xF1u && separationTime <= 0xF9u);
+    if (!frame || capacity < 8 || flowStatus > 2 || !validSeparationTime) return false;
+    memset(frame, 0, 8);
+    frame[0] = (uint8_t)(0x30u | flowStatus);
+    frame[1] = blockSize;
+    frame[2] = separationTime;
+    return true;
+}
+
 static inline bool ctDtcPayloadHasValidPairLength(uint8_t payloadLength) {
     // payloadLength includes the positive 0x43 service byte. Remaining bytes
     // must be an integral number of 2-byte DTCs.
