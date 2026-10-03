@@ -9,6 +9,7 @@
 #include "ct_dbc_validation.h"
 #include "ct_verify.h"
 #include "ct_password.h"
+#include "ct_storage_policy.h"
 #include "ct_json_validation.h"
 #include "ct_battery.h"
 #include "ct_can_config.h"
@@ -723,6 +724,43 @@ void test_ota_firmware_header_check(void) {
     TEST_ASSERT_FALSE(ctOtaFirmwareHeaderOk(NULL, 2));
 }
 
+
+void test_storage_policy_auto_prefers_internal_then_sd(void) {
+    CtStorageDecision d = ctResolveStorage(CT_STORE_AUTO, true, 500000, true, 9000000, 1000);
+    TEST_ASSERT_EQUAL_INT(CT_LOC_INTERNAL, d.loc);
+    d = ctResolveStorage(CT_STORE_AUTO, true, 1000, true, 9000000, 1000);   // internal nearly full
+    TEST_ASSERT_EQUAL_INT(CT_LOC_SD, d.loc);
+    TEST_ASSERT_FALSE(d.fellBack);
+    d = ctResolveStorage(CT_STORE_AUTO, true, 1000, false, 0, 1000);        // no card: never drop silently
+    TEST_ASSERT_EQUAL_INT(CT_LOC_NONE, d.loc);
+}
+
+void test_storage_policy_explicit_choice_falls_back_and_reports(void) {
+    CtStorageDecision d = ctResolveStorage(CT_STORE_SD, true, 500000, false, 0, 1000);
+    TEST_ASSERT_EQUAL_INT(CT_LOC_INTERNAL, d.loc);
+    TEST_ASSERT_TRUE(d.fellBack);
+    d = ctResolveStorage(CT_STORE_INTERNAL, false, 0, true, 9000000, 1000);
+    TEST_ASSERT_EQUAL_INT(CT_LOC_SD, d.loc);
+    TEST_ASSERT_TRUE(d.fellBack);
+    d = ctResolveStorage(CT_STORE_SD, true, 500000, true, 9000000, 1000);
+    TEST_ASSERT_EQUAL_INT(CT_LOC_SD, d.loc);
+    TEST_ASSERT_FALSE(d.fellBack);
+    d = ctResolveStorage(77, true, 500000, true, 9000000, 1000);            // invalid value behaves as AUTO
+    TEST_ASSERT_EQUAL_INT(CT_LOC_INTERNAL, d.loc);
+    TEST_ASSERT_FALSE(ctStorageChoiceValid(3));
+}
+
+void test_sd_cs_pin_validation(void) {
+    const int used[] = { 10, 14, 15 };
+    TEST_ASSERT_TRUE(ctSdCsPinAllowed(5, used, 3));
+    TEST_ASSERT_FALSE(ctSdCsPinAllowed(-1, used, 3));
+    TEST_ASSERT_FALSE(ctSdCsPinAllowed(0, used, 3));    // strapping
+    TEST_ASSERT_FALSE(ctSdCsPinAllowed(19, used, 3));   // USB
+    TEST_ASSERT_FALSE(ctSdCsPinAllowed(30, used, 3));   // flash/PSRAM
+    TEST_ASSERT_FALSE(ctSdCsPinAllowed(14, used, 3));   // already used
+    TEST_ASSERT_FALSE(ctSdCsPinAllowed(49, used, 3));
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_tx_guard_listen_only);
@@ -776,5 +814,8 @@ int main(int, char**) {
     RUN_TEST(test_bus_off_recovery_schedule);
     RUN_TEST(test_generated_password_shape_and_limits);
     RUN_TEST(test_ota_firmware_header_check);
+    RUN_TEST(test_storage_policy_auto_prefers_internal_then_sd);
+    RUN_TEST(test_storage_policy_explicit_choice_falls_back_and_reports);
+    RUN_TEST(test_sd_cs_pin_validation);
     return UNITY_END();
 }
