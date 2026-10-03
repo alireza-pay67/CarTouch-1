@@ -7,7 +7,7 @@
 // for the rest of the firmware. Not yet used by the recorder/profile code.
 class SdStorage {
 public:
-    enum State : uint8_t { DISABLED, NOT_PRESENT, READY, ERROR_STATE };
+    enum State : uint8_t { SD_DISABLED, NOT_PRESENT, READY, ERROR_STATE };
     void begin();                 // read pin from NVS, try one mount
     void update();                // call from loop(); rate-limited, no blocking retries
     State state() const { return _state; }
@@ -19,7 +19,7 @@ public:
 private:
     bool _mount();
     void _unmount();
-    State _state = DISABLED;
+    State _state = SD_DISABLED;
     int _cs = -1;
     uint64_t _total = 0;
     uint32_t _lastTryMs = 0;

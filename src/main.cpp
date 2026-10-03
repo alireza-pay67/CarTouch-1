@@ -1190,7 +1190,7 @@ void refreshModuleStatuses() {
         // SD: DISABLED = no CS pin configured, NOT_PRESENT = no card answering.
         (sdStorage.state() == SdStorage::READY) ? MODULE_READY :
             (sdStorage.state() == SdStorage::ERROR_STATE ? MODULE_ERROR :
-            (sdStorage.state() == SdStorage::DISABLED ? MODULE_DISABLED : MODULE_NOT_PRESENT)),
+            (sdStorage.state() == SdStorage::SD_DISABLED ? MODULE_DISABLED : MODULE_NOT_PRESENT)),
         // Buttons: DISABLED = not configured; UNVERIFIED until a real press is
         // seen (a key that was never pressed looks identical to "not wired").
         buttons.mode() == Buttons::OFF ? MODULE_DISABLED :

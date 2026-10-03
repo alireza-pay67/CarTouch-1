@@ -19,13 +19,13 @@ void SdStorage::begin() {
     int8_t pin = -1;
     if (nvsOpen(h, false)) { nvs_get_i8(h, "sd_cs", &pin); nvs_close(h); }
     _cs = pin;
-    if (_cs < 0) { _state = DISABLED; return; }
+    if (_cs < 0) { _state = SD_DISABLED; return; }
     _mount();
 }
 
 bool SdStorage::_mount() {
     _lastTryMs = millis();
-    if (_cs < 0) { _state = DISABLED; return false; }
+    if (_cs < 0) { _state = SD_DISABLED; return false; }
     // Never format: SD.begin(..., format_if_empty=false).
     if (!SD.begin(_cs, SPI, SD_SPI_HZ, "/sd", 5, false) || SD.cardType() == CARD_NONE) {
         SD.end();
@@ -41,12 +41,12 @@ bool SdStorage::_mount() {
 void SdStorage::_unmount() {
     SD.end();
     _total = 0;
-    _state = (_cs < 0) ? DISABLED : NOT_PRESENT;
+    _state = (_cs < 0) ? SD_DISABLED : NOT_PRESENT;
 }
 
 void SdStorage::update() {
     const uint32_t now = millis();
-    if (_state == DISABLED) return;
+    if (_state == SD_DISABLED) return;
     if (_state == READY) {
         if (now - _lastCheckMs < SD_CHECK_MS) return;
         _lastCheckMs = now;
@@ -87,7 +87,7 @@ bool SdStorage::setCsPin(int pin) {
     if (e != ESP_OK) return false;
     if (_state == READY) _unmount();
     _cs = pin;
-    if (_cs < 0) _state = DISABLED; else _mount();
+    if (_cs < 0) _state = SD_DISABLED; else _mount();
     return true;
 }
 
