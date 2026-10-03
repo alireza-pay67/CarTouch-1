@@ -7,6 +7,7 @@
 
 #include "config.h"
 #include "ct_password.h"
+#include "sd_storage.h"
 #include <esp_random.h>
 #include "ct_can_config.h"
 #include <nvs_flash.h>
@@ -344,6 +345,7 @@ void setDefaultConfig() {
     // Factory Reset must also clear the separate touch-skip flag so the
     // touch wizard is offered again.
     setTouchCalibrationSkipped(false);
+    resetStorageChoices();   // storage choices back to AUTO (SD CS pin is kept)
     if (saveConfig()) {
         configLoaded = true;
     }

@@ -10,6 +10,7 @@
 #include <Arduino.h>
 #include <SPIFFS.h>
 #include <esp_task_wdt.h>
+#include "sd_storage.h"
 
 #include "config.h"
 #include "ct_can_config.h"
@@ -283,6 +284,11 @@ void setup() {
         moduleStatusManager.setState(MODULE_CAN2, MODULE_ERROR);
     }
 
+    // 3b. Optional SD card (after CAN: SPI bus is already initialised).
+    // Missing card or unset CS pin is normal and never blocks boot.
+    sdStorage.begin();
+    Serial.printf("[INIT] SD: %s\n", sdStorage.stateText());
+
     // 4. OBD-II reader
     moduleStatusManager.setState(MODULE_OBD, MODULE_INITIALIZING);
     obd2Reader.setCanBus(getConfig()->obdCanBus == 1 ? CAN_BUS_2 : CAN_BUS_1);
@@ -411,6 +417,7 @@ void loop() {
     // bounded consumer queues (OBD, Learn, monitor, and wake detection).
     canManager.pumpRx();
     canRecorder.update();
+    sdStorage.update();
     bool canWakeActivity = false;
     CanRxFrame wakeFrame;
     while (canManager.receiveRx(CAN_BUS_1, CAN_RX_WAKE, wakeFrame)) {
@@ -591,7 +598,7 @@ static const char* learnStateName(LearnModeState state) {
 
 void processSerialCommand(const char* command) {
     if (strcmp(command, "help") == 0) {
-        Serial.println("Commands: help | status | config | can | obd | dtc read | dtc clear | dtc status | learn | record status | record start <1|2|both> | record stop | record delete <canNNNN.csv> | storage | errors | control <command>");
+        Serial.println("Commands: help | status | config | can | obd | dtc read | dtc clear | dtc status | learn | record status | record start <1|2|both> | record stop | record delete <canNNNN.csv> | storage | sd status | sd cs <gpio|-1> | sd store <cat> <auto|internal|sd> | sd reset | errors | control <command>");
         Serial.println("Control commands use the same selected-profile, verification, Listen-Only, and rate-limit guards as Web/TFT.");
         return;
     }
@@ -709,6 +716,46 @@ void processSerialCommand(const char* command) {
                       learnStateName(learnEngine.getState()),
                       learnEngine.getProgressPercent(),
                       learnEngine.getCandidateCount());
+        return;
+    }
+
+    if (strcmp(command, "sd status") == 0) {
+        Serial.printf("SD state=%s cs=%d total=%llu free=%llu\n", sdStorage.stateText(),
+                      sdStorage.csPin(), (unsigned long long)sdStorage.totalBytes(),
+                      (unsigned long long)sdStorage.freeBytes());
+        static const char* cats[] = { "db", "rec", "prof", "bak" };
+        for (const char* c : cats) {
+            const CtStorageChoice ch = getStorageChoice(c);
+            Serial.printf("  %s: %s\n", c, ch == CT_STORE_SD ? "sd" : ch == CT_STORE_INTERNAL ? "internal" : "auto");
+        }
+        return;
+    }
+    if (strncmp(command, "sd cs ", 6) == 0) {
+        char* end = nullptr;
+        const long pin = strtol(command + 6, &end, 10);
+        if (end == command + 6 || *end != '\0' || pin < -1 || pin > 48) {
+            Serial.println("Usage: sd cs <gpio> (or -1 to disable)");
+        } else if (sdStorage.setCsPin((int)pin)) {
+            Serial.printf("SD CS pin set to %ld; state=%s\n", pin, sdStorage.stateText());
+        } else {
+            Serial.println("Pin rejected: reserved (strapping/USB/flash/PSRAM) or already used, or NVS write failed");
+        }
+        return;
+    }
+    if (strncmp(command, "sd store ", 9) == 0) {
+        char cat[8] = {0}, val[12] = {0};
+        if (sscanf(command + 9, "%7s %11s", cat, val) == 2) {
+            const uint8_t v = !strcmp(val, "auto") ? CT_STORE_AUTO :
+                              !strcmp(val, "internal") ? CT_STORE_INTERNAL :
+                              !strcmp(val, "sd") ? CT_STORE_SD : 255;
+            if (setStorageChoice(cat, v)) { Serial.println("Storage choice saved"); return; }
+        }
+        Serial.println("Usage: sd store <db|rec|prof|bak> <auto|internal|sd>");
+        return;
+    }
+    if (strcmp(command, "sd reset") == 0) {
+        resetStorageChoices();
+        Serial.println("Storage choices reset to auto");
         return;
     }
 
@@ -1095,9 +1142,11 @@ void refreshModuleStatuses() {
         canLinkToModuleState(can2Link),
         // Not every board has PSRAM; its absence is normal, not an error.
         (ESP.getPsramSize() > 0) ? MODULE_READY : MODULE_NOT_PRESENT,
-        // SD card and physical buttons are not implemented yet: reported as
-        // not present until their drivers exist (they will update these).
-        MODULE_NOT_PRESENT,
+        // SD: DISABLED = no CS pin configured, NOT_PRESENT = no card answering.
+        (sdStorage.state() == SdStorage::READY) ? MODULE_READY :
+            (sdStorage.state() == SdStorage::ERROR_STATE ? MODULE_ERROR :
+            (sdStorage.state() == SdStorage::DISABLED ? MODULE_DISABLED : MODULE_NOT_PRESENT)),
+        // Physical buttons: driver not implemented yet.
         MODULE_NOT_PRESENT
     };
     bool changed = false;
