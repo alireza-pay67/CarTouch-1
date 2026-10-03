@@ -8,6 +8,7 @@
 #include "ct_obd_parser.h"
 #include "ct_dbc_validation.h"
 #include "ct_verify.h"
+#include "ct_password.h"
 #include "ct_json_validation.h"
 #include "ct_battery.h"
 #include "ct_can_config.h"
@@ -693,6 +694,35 @@ void test_bus_off_recovery_schedule() {
     TEST_ASSERT_TRUE(ctRecoveryDue(true, 0xFFFFF000u, 0x00001000u, 5000));
 }
 
+
+static uint32_t s_fakeRndState = 12345u;
+static uint32_t fakeRnd(void) { s_fakeRndState = s_fakeRndState * 1664525u + 1013904223u; return s_fakeRndState; }
+
+void test_generated_password_shape_and_limits(void) {
+    char buf[16];
+    ctGeneratePassword(buf, sizeof(buf), fakeRnd);
+    TEST_ASSERT_EQUAL_UINT32(CT_GEN_PASS_LEN, strlen(buf));
+    for (size_t i = 0; i < strlen(buf); i++) {
+        TEST_ASSERT_NULL(strchr("0O1lI", buf[i]));
+    }
+    char a[16], b[16];
+    ctGeneratePassword(a, sizeof(a), fakeRnd);
+    ctGeneratePassword(b, sizeof(b), fakeRnd);
+    TEST_ASSERT_TRUE(strcmp(a, b) != 0);
+    char small[5];
+    ctGeneratePassword(small, sizeof(small), fakeRnd);
+    TEST_ASSERT_EQUAL_UINT32(4, strlen(small));
+}
+
+void test_ota_firmware_header_check(void) {
+    const uint8_t good[] = {0xE9, 0x03};
+    const uint8_t bad[]  = {0x00, 0x03};
+    TEST_ASSERT_TRUE(ctOtaFirmwareHeaderOk(good, 2));
+    TEST_ASSERT_FALSE(ctOtaFirmwareHeaderOk(bad, 2));
+    TEST_ASSERT_FALSE(ctOtaFirmwareHeaderOk(good, 0));
+    TEST_ASSERT_FALSE(ctOtaFirmwareHeaderOk(NULL, 2));
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_tx_guard_listen_only);
@@ -744,5 +774,7 @@ int main(int, char**) {
     RUN_TEST(test_mcp2515_8mhz_timing_table_decodes_to_requested_bitrates);
     RUN_TEST(test_can_link_state_requires_real_traffic);
     RUN_TEST(test_bus_off_recovery_schedule);
+    RUN_TEST(test_generated_password_shape_and_limits);
+    RUN_TEST(test_ota_firmware_header_check);
     return UNITY_END();
 }
