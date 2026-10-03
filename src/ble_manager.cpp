@@ -2,6 +2,7 @@
 
 #include <NimBLEDevice.h>
 #include <Update.h>
+#include "ct_password.h"
 #include "config.h"
 #include "ct_can_record.h"
 #include "ct_time.h"
@@ -64,6 +65,20 @@ class BLEManager::DataCallbacks : public NimBLECharacteristicCallbacks {
 
         std::string value = characteristic->getValue();
         if (value.empty()) return;
+
+        if (gManager->_otaReceived == 0 &&
+            !ctOtaFirmwareHeaderOk(reinterpret_cast<const uint8_t*>(value.data()), value.size())) {
+            gManager->_otaError = true;
+            gManager->_abortOta();
+            gManager->_sendStatus("OTA_BAD_HEADER", info.getConnHandle());
+            return;
+        }
+        if (gManager->_otaReceived + value.size() > gManager->_otaExpected) {
+            gManager->_otaError = true;
+            gManager->_abortOta();
+            gManager->_sendStatus("OTA_TOO_MUCH_DATA", info.getConnHandle());
+            return;
+        }
 
         size_t written = Update.write(reinterpret_cast<uint8_t*>(const_cast<char*>(value.data())), value.size());
         if (written != value.size()) {
@@ -399,6 +414,13 @@ void BLEManager::_abortOta() {
 
 bool BLEManager::_finishOta() {
     if (!Update.isRunning()) return false;
+    if (_otaReceived != _otaExpected) {
+        Serial.printf("[BLE OTA] Size mismatch: got %u of %u bytes\n",
+                      (unsigned)_otaReceived, (unsigned)_otaExpected);
+        _otaError = true;
+        _abortOta();
+        return false;
+    }
     if (!Update.end(true)) {
         Serial.printf("[BLE OTA] Finalize failed: %s\n", Update.errorString());
         _otaError = true;

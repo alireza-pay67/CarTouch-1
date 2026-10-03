@@ -341,6 +341,9 @@ bool setWebPassword(const char* newUser, const char* newPass) {
 
 void setDefaultConfig() {
     applyDefaultConfigValues();
+    // Factory Reset must also clear the separate touch-skip flag so the
+    // touch wizard is offered again.
+    setTouchCalibrationSkipped(false);
     if (saveConfig()) {
         configLoaded = true;
     }
