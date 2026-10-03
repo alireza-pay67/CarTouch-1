@@ -3,6 +3,8 @@
 #include <NimBLEDevice.h>
 #include <Update.h>
 #include "config.h"
+#include "ct_can_record.h"
+#include "ct_time.h"
 
 namespace {
 static const char* BLE_SERVICE_UUID  = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
@@ -18,30 +20,47 @@ BLEManager* gManager = nullptr;
 }
 
 class BLEManager::ServerCallbacks : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer*, NimBLEConnInfo&) override {
-        if (gManager) gManager->_connected = true;
+    void onConnect(NimBLEServer*, NimBLEConnInfo& info) override {
+        if (gManager) {
+            gManager->_connected = true;
+            gManager->_commandAuthenticated = false;
+            gManager->_commandConnHandle = info.getConnHandle();
+        }
         if (gStatus) gStatus->setValue("CONNECTED");
     }
 
-    void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
+    void onDisconnect(NimBLEServer*, NimBLEConnInfo& info, int) override {
         if (gManager) {
-            gManager->_connected = false;
-            if (gManager->_otaInProgress) gManager->_abortOta();
+            if (gManager->_commandConnHandle == info.getConnHandle()) {
+                gManager->_commandAuthenticated = false;
+                gManager->_commandConnHandle = BLE_HS_CONN_HANDLE_NONE;
+            }
+            if (gManager->_otaInProgress &&
+                gManager->_otaConnHandle == info.getConnHandle()) {
+                gManager->_abortOta();
+            }
+            gManager->_connected = gServer && gServer->getConnectedCount() > 0;
         }
         if (gServer) gServer->startAdvertising();
     }
 };
 
 class BLEManager::CommandCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo&) override {
+    void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& info) override {
         if (!gManager) return;
-        gManager->_handleCommand(characteristic->getValue().c_str());
+        const std::string value = characteristic->getValue();
+        if (value.size() > 96) {
+            gManager->_sendStatus("COMMAND_TOO_LONG", info.getConnHandle());
+            return;
+        }
+        gManager->_handleCommand(String(value.c_str()), info.getConnHandle());
     }
 };
 
 class BLEManager::DataCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo&) override {
-        if (!gManager || !gManager->_otaInProgress || !gManager->_otaAuthenticated) return;
+    void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& info) override {
+        if (!gManager || !gManager->_otaInProgress || !gManager->_otaAuthenticated ||
+            gManager->_otaConnHandle != info.getConnHandle()) return;
 
         std::string value = characteristic->getValue();
         if (value.empty()) return;
@@ -50,15 +69,15 @@ class BLEManager::DataCallbacks : public NimBLECharacteristicCallbacks {
         if (written != value.size()) {
             gManager->_otaError = true;
             gManager->_abortOta();
-            if (gStatus) gStatus->setValue("OTA_WRITE_ERROR");
+            gManager->_sendStatus("OTA_WRITE_ERROR", info.getConnHandle());
             return;
         }
 
         gManager->_otaReceived += static_cast<uint32_t>(written);
         if (gStatus) {
             String status = "OTA_PROGRESS:" + String(gManager->_otaReceived) + ":" + String(gManager->_otaExpected);
-            gStatus->setValue(status.c_str());
-            gStatus->notify();
+            gStatus->notify(reinterpret_cast<const uint8_t*>(status.c_str()),
+                            status.length(), info.getConnHandle());
         }
     }
 };
@@ -67,8 +86,23 @@ BLEManager bleManager;
 
 BLEManager::BLEManager()
     : _started(false), _connected(false), _otaInProgress(false),
-      _otaAuthenticated(false), _otaError(false), _otaExpected(0),
-      _otaReceived(0), _rebootAt(0), _deviceName("CarTouch") {}
+      _otaAuthenticated(false), _otaError(false), _commandAuthenticated(false),
+    _commandFailCount(0), _commandLockUntil(0),
+    _otaConnHandle(BLE_HS_CONN_HANDLE_NONE),
+    _commandConnHandle(BLE_HS_CONN_HANDLE_NONE), _hasDeviceCommand(false),
+    _lastDeviceCommandMs(0), _otaExpected(0),
+      _otaReceived(0), _rebootAt(0), _deviceName("CarTouch"),
+      _commandCallback(nullptr) {}
+
+void BLEManager::setCommandCallback(BLECommandCallback callback) {
+    _commandCallback = callback;
+}
+
+void BLEManager::publishStatus(const char* status) {
+    if (_commandAuthenticated && _connected) {
+        _sendStatus(status ? status : "STATUS_UNAVAILABLE", _commandConnHandle);
+    }
+}
 
 bool BLEManager::begin() {
     if (_started) return true;
@@ -117,44 +151,151 @@ void BLEManager::update() {
     }
 }
 
-void BLEManager::_sendStatus(const char* status) {
-    if (gStatus) {
-        gStatus->setValue(status);
-        if (_connected) gStatus->notify();
-    }
+void BLEManager::_sendStatus(const char* status, uint16_t connHandle) {
+    if (!gStatus || !_connected || connHandle == BLE_HS_CONN_HANDLE_NONE) return;
+    gStatus->notify(reinterpret_cast<const uint8_t*>(status), strlen(status), connHandle);
 }
 
-void BLEManager::_handleCommand(const String& command) {
+bool BLEManager::_authenticateCommand(const String& password, uint16_t connHandle) {
+    if (isUsingDefaultPassword()) return false;
+    if (_commandLockUntil != 0 && (int32_t)(millis() - _commandLockUntil) < 0) return false;
+    if (_commandLockUntil != 0) {
+        _commandLockUntil = 0;
+        _commandFailCount = 0;
+    }
+
+    const char* expected = getConfig()->webPass;
+    const size_t expectedLength = strlen(expected);
+    const size_t passwordLength = password.length();
+    uint8_t diff = (uint8_t)(expectedLength != passwordLength);
+    for (size_t i = 0; i < expectedLength; ++i) {
+        diff |= (uint8_t)(expected[i] ^ (i < passwordLength ? password[i] : 0));
+    }
+    if (diff == 0) {
+        _commandAuthenticated = true;
+        _commandConnHandle = connHandle;
+        _commandFailCount = 0;
+        _commandLockUntil = 0;
+        return true;
+    }
+
+    if (++_commandFailCount >= 5) {
+        _commandFailCount = 0;
+        _commandLockUntil = millis() + 60000;
+        if (_commandLockUntil == 0) _commandLockUntil = 1;
+    }
+    return false;
+}
+
+void BLEManager::_handleCommand(const String& command, uint16_t connHandle) {
     String cmd = command;
     cmd.trim();
 
     if (cmd.equalsIgnoreCase("STATUS")) {
         String status = "READY:" + String(_otaInProgress ? "OTA" : "IDLE");
-        _sendStatus(status.c_str());
+        _sendStatus(status.c_str(), connHandle);
+        return;
+    }
+
+    if (cmd.startsWith("AUTH:")) {
+        if (_authenticateCommand(cmd.substring(5), connHandle)) _sendStatus("COMMAND_AUTHENTICATED", connHandle);
+        else _sendStatus(_commandLockUntil ? "COMMAND_LOCKED" : "COMMAND_AUTH_FAILED", connHandle);
+        return;
+    }
+
+    if (cmd.equalsIgnoreCase("LOGOUT")) {
+        if (_commandConnHandle == connHandle) _commandAuthenticated = false;
+        _sendStatus("COMMAND_LOGGED_OUT", connHandle);
+        return;
+    }
+
+    if (cmd.equalsIgnoreCase("DTC:READ") || cmd.equalsIgnoreCase("DTC:CLEAR") ||
+        cmd.equalsIgnoreCase("DTC:STATUS")) {
+        if (!_commandAuthenticated || _commandConnHandle != connHandle) {
+            _sendStatus("COMMAND_AUTH_REQUIRED", connHandle);
+            return;
+        }
+        if (!_commandCallback) {
+            _sendStatus("COMMAND_UNAVAILABLE", connHandle);
+            return;
+        }
+        if (_hasDeviceCommand &&
+            !ctElapsedAtLeast(millis(), _lastDeviceCommandMs, 300)) {
+            _sendStatus("COMMAND_RATE_LIMITED", connHandle);
+            return;
+        }
+        _hasDeviceCommand = true;
+        _lastDeviceCommandMs = millis();
+        _commandCallback(cmd.equalsIgnoreCase("DTC:READ") ? "dtc_read" :
+            cmd.equalsIgnoreCase("DTC:CLEAR") ? "dtc_clear" : "dtc_status");
+        _sendStatus("COMMAND_QUEUED", connHandle);
+        return;
+    }
+
+    if (cmd.startsWith("RECORD:")) {
+        if (!_commandAuthenticated || _commandConnHandle != connHandle) {
+            _sendStatus("COMMAND_AUTH_REQUIRED", connHandle);
+            return;
+        }
+        if (!_commandCallback) {
+            _sendStatus("COMMAND_UNAVAILABLE", connHandle);
+            return;
+        }
+        if (_hasDeviceCommand &&
+            !ctElapsedAtLeast(millis(), _lastDeviceCommandMs, 300)) {
+            _sendStatus("COMMAND_RATE_LIMITED", connHandle);
+            return;
+        }
+        _hasDeviceCommand = true;
+        _lastDeviceCommandMs = millis();
+        String action = cmd.substring(7);
+        if (action.equalsIgnoreCase("START:1")) _commandCallback("record_start:1");
+        else if (action.equalsIgnoreCase("START:2")) _commandCallback("record_start:2");
+        else if (action.equalsIgnoreCase("START:BOTH")) _commandCallback("record_start:3");
+        else if (action.equalsIgnoreCase("STOP")) _commandCallback("record_stop");
+        else if (action.equalsIgnoreCase("STATUS")) _commandCallback("record_status");
+        else if (action.startsWith("DELETE:") &&
+                 ctCanRecordFilenameValid(action.substring(7).c_str())) {
+            const String fileName = action.substring(7);
+            const String queued = "record_delete:" + fileName;
+            _commandCallback(queued.c_str());
+        } else {
+            _sendStatus("COMMAND_BAD_REQUEST", connHandle);
+            return;
+        }
+        _sendStatus("COMMAND_QUEUED", connHandle);
         return;
     }
 
     if (cmd.equalsIgnoreCase("ABORT")) {
+        const bool ownsOta = _otaInProgress && _otaAuthenticated &&
+                             _otaConnHandle == connHandle;
+        const bool ownsCommandSession = _commandAuthenticated &&
+                                        _commandConnHandle == connHandle;
+        if ((_otaInProgress && !ownsOta) || (!_otaInProgress && !ownsCommandSession)) {
+            _sendStatus("COMMAND_AUTH_REQUIRED", connHandle);
+            return;
+        }
         _abortOta();
-        _sendStatus("OTA_ABORTED");
+        _sendStatus("OTA_ABORTED", connHandle);
         return;
     }
 
     if (cmd.equalsIgnoreCase("END")) {
-        if (!_otaInProgress || !_otaAuthenticated) {
-            _sendStatus("OTA_NOT_STARTED");
+        if (!_otaInProgress || !_otaAuthenticated || _otaConnHandle != connHandle) {
+            _sendStatus("OTA_NOT_STARTED", connHandle);
             return;
         }
         if (_otaReceived != _otaExpected) {
-            _sendStatus("OTA_SIZE_MISMATCH");
+            _sendStatus("OTA_SIZE_MISMATCH", connHandle);
             _abortOta();
             return;
         }
         if (!_finishOta()) {
-            _sendStatus("OTA_FINALIZE_ERROR");
+            _sendStatus("OTA_FINALIZE_ERROR", connHandle);
             return;
         }
-        _sendStatus("OTA_OK_REBOOTING");
+        _sendStatus("OTA_OK_REBOOTING", connHandle);
         _rebootAt = millis() + 1500;
         return;
     }
@@ -164,32 +305,37 @@ void BLEManager::_handleCommand(const String& command) {
         int second = cmd.lastIndexOf(':');    // size is after the LAST ':' so passwords may contain ':'
         if (second <= first) second = -1;
         if (second < 0) {
-            _sendStatus("OTA_BAD_COMMAND");
+            _sendStatus("OTA_BAD_COMMAND", connHandle);
             return;
         }
 
         if (isUsingDefaultPassword()) {
-            _sendStatus("OTA_CHANGE_DEFAULT_PASSWORD");
+            _sendStatus("OTA_CHANGE_DEFAULT_PASSWORD", connHandle);
             return;
         }
         String password = cmd.substring(first + 1, second);
         uint32_t size = static_cast<uint32_t>(cmd.substring(second + 1).toInt());
         if (size == 0) {
-            _sendStatus("OTA_BAD_SIZE");
+            _sendStatus("OTA_BAD_SIZE", connHandle);
             return;
         }
-        if (!_startOta(size, password)) {
-            _sendStatus(_otaError ? "OTA_AUTH_OR_START_ERROR" : "OTA_START_ERROR");
+        if (!_startOta(size, password, connHandle)) {
+            _sendStatus(_otaError ? "OTA_AUTH_OR_START_ERROR" : "OTA_START_ERROR", connHandle);
         } else {
-            _sendStatus("OTA_STARTED");
+            _sendStatus("OTA_STARTED", connHandle);
         }
         return;
     }
 
-    _sendStatus("UNKNOWN_COMMAND");
+    _sendStatus("UNKNOWN_COMMAND", connHandle);
 }
 
-bool BLEManager::_startOta(uint32_t size, const String& password) {
+bool BLEManager::_startOta(uint32_t size, const String& password,
+                           uint16_t connHandle) {
+    if (_otaInProgress && _otaConnHandle != connHandle) {
+        _otaError = true;
+        return false;
+    }
     _otaError = false;
     _otaAuthenticated = false;
     _otaExpected = 0;
@@ -237,6 +383,7 @@ bool BLEManager::_startOta(uint32_t size, const String& password) {
     _otaReceived = 0;
     _otaAuthenticated = true;
     _otaInProgress = true;
+    _otaConnHandle = connHandle;
     Serial.printf("[BLE OTA] Started: %u bytes\n", (unsigned)size);
     return true;
 }
@@ -247,6 +394,7 @@ void BLEManager::_abortOta() {
     _otaAuthenticated = false;
     _otaExpected = 0;
     _otaReceived = 0;
+    _otaConnHandle = BLE_HS_CONN_HANDLE_NONE;
 }
 
 bool BLEManager::_finishOta() {
@@ -260,6 +408,7 @@ bool BLEManager::_finishOta() {
 
     _otaInProgress = false;
     _otaAuthenticated = false;
+    _otaConnHandle = BLE_HS_CONN_HANDLE_NONE;
     Serial.printf("[BLE OTA] Finished successfully: %u bytes\n", (unsigned)_otaReceived);
     return true;
 }

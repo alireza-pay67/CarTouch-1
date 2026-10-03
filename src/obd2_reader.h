@@ -12,6 +12,7 @@
 #include <Arduino.h>
 #include "config.h"
 #include "can_service.h"
+#include "ct_obd_parser.h"
 
 // State machine states for the non-blocking multi-PID poll cycle
 
@@ -24,6 +25,21 @@ enum ObdPollState : uint8_t {
     OBD_POLL_SENDING,     // Sending the request for the current PID
     OBD_POLL_WAITING,     // Waiting for the current PID's response (no delay/loop)
     OBD_POLL_DONE         // A full round (all PIDs) has completed
+};
+
+enum ObdDiagnosticState : uint8_t {
+    OBD_DIAG_IDLE = 0,
+    OBD_DIAG_READ_WAITING,
+    OBD_DIAG_READ_CONSECUTIVE,
+    OBD_DIAG_CLEAR_WAITING,
+    OBD_DIAG_COMPLETE,
+    OBD_DIAG_FAILED
+};
+
+enum ObdDiagnosticOperation : uint8_t {
+    OBD_DIAG_OP_NONE = 0,
+    OBD_DIAG_OP_READ_DTCS,
+    OBD_DIAG_OP_CLEAR_DTCS
 };
 
 struct ObdResponse {
@@ -102,6 +118,18 @@ public:
     /** Clears stored DTCs. */
     bool clearDTCs();
 
+    bool startDtcRead();
+    bool startDtcClear();
+    bool isDiagnosticBusy() const;
+    ObdDiagnosticState getDiagnosticState() const { return _diagnosticState; }
+    ObdDiagnosticOperation getDiagnosticOperation() const { return _diagnosticOperation; }
+    uint8_t getDiagnosticError() const { return _diagnosticError; }
+    uint8_t getDiagnosticResponseCode() const { return _diagnosticResponseCode; }
+    uint8_t getDtcCount() const { return _dtcCount; }
+    uint16_t getDtc(uint8_t index) const {
+        return index < _dtcCount ? _dtcList[index] : 0;
+    }
+
     uint8_t getLastError();
     bool hasReceivedData() const { return _hasCompletedRound; }
 
@@ -132,9 +160,22 @@ private:
     uint32_t     _pollIntervalMs;                // Spacing between rounds (not between PIDs)
     uint32_t     _lastRoundStartMs;
 
+    ObdDiagnosticState _diagnosticState;
+    ObdDiagnosticOperation _diagnosticOperation;
+    uint32_t _diagnosticStartMs;
+    uint8_t _diagnosticError;
+    uint8_t _diagnosticResponseCode;
+    uint8_t _dtcCount;
+    uint16_t _dtcList[MAX_DTC_COUNT];
+    uint8_t _dtcPayload[1 + (2 * MAX_DTC_COUNT)];
+    CtIsoTpReassembly _dtcReassembly;
+
     void _pollStartNextPid();                                                         // Sends the current PID's request (non-blocking)
     void _pollCheckResponse();                                                        // Non-blocking receive-queue check
     void _applyPidToData(uint8_t pid, const ObdResponse& resp, VehicleData& data);
+    bool _startDiagnosticRequest(uint8_t service, ObdDiagnosticOperation operation);
+    void _updateDiagnostic();
+    void _finishDtcRead(const uint8_t* payload, uint16_t length);
 };
 
 #endif    // OBD2_READER_H

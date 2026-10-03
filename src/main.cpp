@@ -15,6 +15,8 @@
 #include "ct_can_config.h"
 #include "can_manager.h"
 #include "can_service.h"
+#include "can_recorder.h"
+#include "ct_can_record.h"
 #include "mcp2515_can_interface.h"
 #include "obd2_reader.h"
 #include "vehicle_control.h"
@@ -37,6 +39,7 @@
 CANManager can1Interface(PIN_CAN_TX, PIN_CAN_RX, CAN_SPEED);
 Mcp2515CanInterface can2Interface;
 CANService canManager(can1Interface, can2Interface);
+CanRecorder canRecorder(canManager);
 OBD2Reader obd2Reader(canManager);
 
 // Vehicle database (DBC). Allocated on the heap in setup() rather than as
@@ -60,6 +63,66 @@ WiFiManager wifiManager;
 ModuleStatusManager moduleStatusManager;
 bool filesystemReady = false;
 bool customVehicleStoreReady = false;
+
+static void broadcastCanRecorderStatus() {
+    webServer.broadcastCanRecordingStatus(canRecorder.isRecording(),
+                                          canRecorder.getBusMask(),
+                                          canRecorder.getFrameCount(),
+                                          canRecorder.getDroppedFrameCount(),
+                                          canRecorder.getFileName(),
+                                          canRecorder.getLastError());
+    char bleStatus[112];
+    snprintf(bleStatus, sizeof(bleStatus), "RECORD:%u:%u:%lu:%lu",
+             canRecorder.isRecording() ? 1u : 0u,
+             canRecorder.getBusMask(),
+             (unsigned long)canRecorder.getFrameCount(),
+             (unsigned long)canRecorder.getDroppedFrameCount());
+    bleManager.publishStatus(bleStatus);
+}
+
+static void broadcastObdDiagnosticStatus() {
+    uint16_t dtcs[MAX_DTC_COUNT] = {};
+    const uint8_t count = obd2Reader.getDtcCount();
+    for (uint8_t i = 0; i < count; ++i) dtcs[i] = obd2Reader.getDtc(i);
+    webServer.broadcastObdDiagnosticStatus(
+        (uint8_t)obd2Reader.getDiagnosticState(),
+        (uint8_t)obd2Reader.getDiagnosticOperation(),
+        obd2Reader.getDiagnosticError(),
+        obd2Reader.getDiagnosticResponseCode(), dtcs, count);
+
+    static bool previousValid = false;
+    static uint8_t previousState = 0;
+    static uint8_t previousOperation = 0;
+    static uint8_t previousError = 0;
+    static uint8_t previousResponseCode = 0;
+    static uint8_t previousCount = 0;
+    static uint16_t previousDtcs[MAX_DTC_COUNT] = {};
+    bool changed = !previousValid || previousState != (uint8_t)obd2Reader.getDiagnosticState() ||
+        previousOperation != (uint8_t)obd2Reader.getDiagnosticOperation() ||
+        previousError != obd2Reader.getDiagnosticError() ||
+        previousResponseCode != obd2Reader.getDiagnosticResponseCode() ||
+        previousCount != count;
+    for (uint8_t i = 0; i < count && !changed; ++i) changed = previousDtcs[i] != dtcs[i];
+    if (changed) {
+        String bleStatus = "DTC:" + String((uint8_t)obd2Reader.getDiagnosticState()) + ":" +
+            String((uint8_t)obd2Reader.getDiagnosticOperation()) + ":" +
+            String(obd2Reader.getDiagnosticError()) + ":" +
+            String(obd2Reader.getDiagnosticResponseCode()) + ":" + String(count);
+        for (uint8_t i = 0; i < count; ++i) {
+            char code[6];
+            snprintf(code, sizeof(code), ":%04X", (unsigned)dtcs[i]);
+            bleStatus += code;
+            previousDtcs[i] = dtcs[i];
+        }
+        bleManager.publishStatus(bleStatus.c_str());
+        previousState = (uint8_t)obd2Reader.getDiagnosticState();
+        previousOperation = (uint8_t)obd2Reader.getDiagnosticOperation();
+        previousError = obd2Reader.getDiagnosticError();
+        previousResponseCode = obd2Reader.getDiagnosticResponseCode();
+        previousCount = count;
+        previousValid = true;
+    }
+}
 
 // ○○○○○○○○○○○○○○○○○○○○○○○○○○○○○○
 // ○○○○○○○○○○ Global state
@@ -184,6 +247,7 @@ void setup() {
         Serial.println("[INIT] SPIFFS ready");
         moduleStatusManager.setState(MODULE_STORAGE, MODULE_READY);
     }
+    canRecorder.setStorageAvailable(filesystemReady);
 
     // 3. CAN Bus
     Serial.println("[INIT] Starting CAN Bus...");
@@ -289,6 +353,7 @@ void setup() {
 
     // 10. BLE - starts independently of Wi-Fi so local BLE access remains available.
     moduleStatusManager.setState(MODULE_BLE, MODULE_INITIALIZING);
+    bleManager.setCommandCallback(handleCommand);
     if (!bleManager.begin()) {
         Serial.println("[BLE] Failed to start BLE");
         moduleStatusManager.setState(MODULE_BLE, MODULE_ERROR);
@@ -339,6 +404,7 @@ void loop() {
     // One task owns hardware RX and fans each frame out to independent,
     // bounded consumer queues (OBD, Learn, monitor, and wake detection).
     canManager.pumpRx();
+    canRecorder.update();
     bool canWakeActivity = false;
     CanRxFrame wakeFrame;
     while (canManager.receiveRx(CAN_BUS_1, CAN_RX_WAKE, wakeFrame)) {
@@ -355,6 +421,18 @@ void loop() {
 
     // 2. WebSocket
     webServer.update();
+
+    static uint32_t lastCanRecordingStatusBroadcast = 0;
+    if ((uint32_t)(millis() - lastCanRecordingStatusBroadcast) >= 1000) {
+        broadcastCanRecorderStatus();
+        lastCanRecordingStatusBroadcast = millis();
+    }
+
+    static uint32_t lastObdDiagnosticBroadcast = 0;
+    if ((uint32_t)(millis() - lastObdDiagnosticBroadcast) >= 500) {
+        broadcastObdDiagnosticStatus();
+        lastObdDiagnosticBroadcast = millis();
+    }
 
     static uint32_t lastCanDiagnosticsBroadcast = 0;
     if ((uint32_t)(millis() - lastCanDiagnosticsBroadcast) >= 1000) {
@@ -403,9 +481,10 @@ void loop() {
     // Listen-Only is active, since reading OBD data requires transmitting
     // a request. obd2Reader.update() advances one small step per call;
     // getLatestData() picks up the result once a full round completes.
-    if (currentMode == MODE_ACTIVE &&
-        obd2Reader.canTransmit() &&
-        (millis() - lastWakeTime >= WAKE_OBD_TX_HOLD_MS)) {
+    if (obd2Reader.isDiagnosticBusy()) {
+        obd2Reader.update();
+    } else if (currentMode == MODE_ACTIVE && obd2Reader.canTransmit() &&
+               (millis() - lastWakeTime >= WAKE_OBD_TX_HOLD_MS)) {
         obd2Reader.update();
 
         if (millis() - lastDataUpdateTime > obdReadInterval) {
@@ -438,6 +517,8 @@ void loop() {
     if (learnEngine.isActiveCaptureState()) {
         // Only real capture windows count as continuous activity. Terminal,
         // error and candidate-review states must not disable auto-sleep forever.
+        lastActivityTime = millis();
+    } else if (canRecorder.isRecording()) {
         lastActivityTime = millis();
     } else {
         checkAutoSleep();
@@ -497,8 +578,47 @@ static const char* learnStateName(LearnModeState state) {
 
 void processSerialCommand(const char* command) {
     if (strcmp(command, "help") == 0) {
-        Serial.println("Commands: help | status | config | can | obd | learn | storage | errors | control <command>");
+        Serial.println("Commands: help | status | config | can | obd | dtc read | dtc clear | dtc status | learn | record status | record start <1|2|both> | record stop | record delete <canNNNN.csv> | storage | errors | control <command>");
         Serial.println("Control commands use the same selected-profile, verification, Listen-Only, and rate-limit guards as Web/TFT.");
+        return;
+    }
+
+    if (strcmp(command, "record status") == 0) {
+        processCommand("record_status");
+        return;
+    }
+
+    if (strncmp(command, "record start ", 13) == 0) {
+        const char* bus = command + 13;
+        const char* mask = strcmp(bus, "1") == 0 ? "1" :
+                           strcmp(bus, "2") == 0 ? "2" :
+                           strcmp(bus, "both") == 0 ? "3" : nullptr;
+        if (!mask) {
+            Serial.println("Usage: record start <1|2|both>");
+            return;
+        }
+        char queuedCommand[32];
+        snprintf(queuedCommand, sizeof(queuedCommand), "record_start:%s", mask);
+        processCommand(queuedCommand);
+        return;
+    }
+
+    if (strcmp(command, "record stop") == 0) {
+        processCommand("record_stop");
+        return;
+    }
+
+    if (strncmp(command, "record delete ", 14) == 0) {
+        char queuedCommand[32];
+        snprintf(queuedCommand, sizeof(queuedCommand), "record_delete:%s", command + 14);
+        processCommand(queuedCommand);
+        return;
+    }
+
+    if (strcmp(command, "dtc read") == 0 || strcmp(command, "dtc clear") == 0 ||
+        strcmp(command, "dtc status") == 0) {
+        processCommand(strcmp(command, "dtc read") == 0 ? "dtc_read" :
+                       strcmp(command, "dtc clear") == 0 ? "dtc_clear" : "dtc_status");
         return;
     }
 
@@ -678,6 +798,85 @@ void processCommand(const char* command) {
     lastActivityTime = millis();
 
     Serial.printf("[CMD] Received: %s\n", command);
+
+    if (strncmp(command, "record_start:", 13) == 0) {
+        char* end = nullptr;
+        const long mask = strtol(command + 13, &end, 10);
+        if (end == command + 13 || *end != '\0' || mask < 1 || mask > 3) {
+            Serial.println("[RECORDER] Invalid bus mask");
+        } else if (canRecorder.start((uint8_t)mask)) {
+            Serial.printf("[RECORDER] Started %s on CAN mask %ld\n",
+                          canRecorder.getFileName(), mask);
+        } else {
+            Serial.printf("[RECORDER] Start failed: %s\n", canRecorder.getLastError());
+        }
+        broadcastCanRecorderStatus();
+        return;
+    }
+
+    if (strcmp(command, "record_stop") == 0) {
+        canRecorder.stop();
+        Serial.printf("[RECORDER] Stopped frames=%lu dropped=%lu file=%s error=%s\n",
+                      (unsigned long)canRecorder.getFrameCount(),
+                      (unsigned long)canRecorder.getDroppedFrameCount(),
+                      canRecorder.getFileName(), canRecorder.getLastError());
+                broadcastCanRecorderStatus();
+        return;
+    }
+
+    if (strcmp(command, "record_status") == 0) {
+        Serial.printf("[RECORDER] recording=%s buses=%u frames=%lu dropped=%lu file=%s error=%s\n",
+                      canRecorder.isRecording() ? "active" : "stopped",
+                      canRecorder.getBusMask(),
+                      (unsigned long)canRecorder.getFrameCount(),
+                      (unsigned long)canRecorder.getDroppedFrameCount(),
+                      canRecorder.getFileName(), canRecorder.getLastError());
+                broadcastCanRecorderStatus();
+        return;
+    }
+
+            if (strncmp(command, "record_delete:", 14) == 0) {
+                const char* fileName = command + 14;
+                if (!ctCanRecordFilenameValid(fileName)) {
+                    Serial.println("[RECORDER] Invalid recording filename");
+                } else if (canRecorder.deleteRecording(fileName)) {
+                    Serial.printf("[RECORDER] Deleted %s\n", fileName);
+                    webServer.broadcastCanRecordingFilesChanged();
+                } else {
+                    Serial.printf("[RECORDER] Delete failed: %s\n", canRecorder.getLastError());
+                }
+                broadcastCanRecorderStatus();
+                return;
+            }
+
+    if (strcmp(command, "dtc_read") == 0 || strcmp(command, "dtc_clear") == 0) {
+        if (currentMode != MODE_ACTIVE) {
+            Serial.println("[OBD] DTC operation rejected while device is asleep");
+            return;
+        }
+        const bool started = strcmp(command, "dtc_read") == 0
+            ? obd2Reader.startDtcRead() : obd2Reader.startDtcClear();
+        Serial.printf("[OBD] DTC request %s: %s\n",
+                      strcmp(command, "dtc_read") == 0 ? "read" : "clear",
+                      started ? "started" : "rejected (busy, Listen-Only, or CAN unavailable)");
+        broadcastObdDiagnosticStatus();
+        return;
+    }
+
+    if (strcmp(command, "dtc_status") == 0) {
+        Serial.printf("[OBD] DTC operation=%u state=%u error=%u NRC=0x%02X count=%u\n",
+                      (unsigned)obd2Reader.getDiagnosticOperation(),
+                      (unsigned)obd2Reader.getDiagnosticState(),
+                      (unsigned)obd2Reader.getDiagnosticError(),
+                      (unsigned)obd2Reader.getDiagnosticResponseCode(),
+                      (unsigned)obd2Reader.getDtcCount());
+        for (uint8_t i = 0; i < obd2Reader.getDtcCount(); ++i) {
+            Serial.printf("  DTC[%u]=0x%04X\n", (unsigned)i,
+                          (unsigned)obd2Reader.getDtc(i));
+        }
+        broadcastObdDiagnosticStatus();
+        return;
+    }
 
     // While asleep, reject physical-control commands instead of allowing a
     // Web/TFT event queued before/around wake to trigger immediate CAN TX.

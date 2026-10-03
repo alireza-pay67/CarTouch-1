@@ -12,6 +12,7 @@
 #include "ct_battery.h"
 #include "ct_can_config.h"
 #include "ct_storage_guard.h"
+#include "ct_can_record.h"
 #include "can_service.h"
 
 void setUp(void) {}
@@ -233,6 +234,103 @@ void test_can_service_fans_out_frames_to_independent_subscribers(void) {
     TEST_ASSERT_FALSE(service.receiveRx(CAN_BUS_1, CAN_RX_LEARN, learnFrame));
 }
 
+void test_can_service_pumps_both_buses_independently(void) {
+    MockCanInterface can1;
+    MockCanInterface can2;
+    can1.active = can2.active = true;
+    can1.scriptedRx = can2.scriptedRx = true;
+    can1.rxFrameCount = can2.rxFrameCount = 2;
+    can1.rxFrames[0].id = 0x111;
+    can1.rxFrames[1].id = 0x112;
+    can2.rxFrames[0].id = 0x221;
+    can2.rxFrames[1].id = 0x222;
+
+    CANService service(can1, can2);
+    TEST_ASSERT_TRUE(service.subscribeRx(CAN_BUS_1, CAN_RX_MONITOR));
+    TEST_ASSERT_TRUE(service.subscribeRx(CAN_BUS_2, CAN_RX_MONITOR));
+    TEST_ASSERT_EQUAL(4, service.pumpRx(2));
+
+    CanRxFrame frame = {};
+    TEST_ASSERT_TRUE(service.receiveRx(CAN_BUS_1, CAN_RX_MONITOR, frame));
+    TEST_ASSERT_EQUAL(CAN_BUS_1, frame.bus);
+    TEST_ASSERT_EQUAL_HEX32(0x111, frame.message.id);
+    TEST_ASSERT_TRUE(service.receiveRx(CAN_BUS_1, CAN_RX_MONITOR, frame));
+    TEST_ASSERT_EQUAL_HEX32(0x112, frame.message.id);
+    TEST_ASSERT_FALSE(service.receiveRx(CAN_BUS_1, CAN_RX_MONITOR, frame));
+
+    TEST_ASSERT_TRUE(service.receiveRx(CAN_BUS_2, CAN_RX_MONITOR, frame));
+    TEST_ASSERT_EQUAL(CAN_BUS_2, frame.bus);
+    TEST_ASSERT_EQUAL_HEX32(0x221, frame.message.id);
+    TEST_ASSERT_TRUE(service.receiveRx(CAN_BUS_2, CAN_RX_MONITOR, frame));
+    TEST_ASSERT_EQUAL_HEX32(0x222, frame.message.id);
+    TEST_ASSERT_FALSE(service.receiveRx(CAN_BUS_2, CAN_RX_MONITOR, frame));
+}
+
+void test_can_service_fans_out_to_monitor_and_recorder(void) {
+    MockCanInterface can1;
+    MockCanInterface can2;
+    can1.active = true;
+    can1.scriptedRx = true;
+    can1.rxFrameCount = 1;
+    can1.rxFrames[0].id = 0x456;
+    can1.rxFrames[0].length = 2;
+    can1.rxFrames[0].data[0] = 0xAB;
+    can1.rxFrames[0].data[1] = 0xCD;
+
+    CANService service(can1, can2);
+    TEST_ASSERT_TRUE(service.subscribeRx(CAN_BUS_1, CAN_RX_MONITOR));
+    TEST_ASSERT_TRUE(service.subscribeRx(CAN_BUS_1, CAN_RX_RECORDER));
+    TEST_ASSERT_EQUAL(1, service.pumpRx());
+
+    CanRxFrame monitorFrame = {};
+    CanRxFrame recordFrame = {};
+    TEST_ASSERT_TRUE(service.receiveRx(CAN_BUS_1, CAN_RX_MONITOR, monitorFrame));
+    TEST_ASSERT_TRUE(service.receiveRx(CAN_BUS_1, CAN_RX_RECORDER, recordFrame));
+    TEST_ASSERT_EQUAL_HEX32(0x456, monitorFrame.message.id);
+    TEST_ASSERT_EQUAL_HEX32(monitorFrame.message.id, recordFrame.message.id);
+    TEST_ASSERT_EQUAL_HEX8(0xAB, recordFrame.message.data[0]);
+    TEST_ASSERT_EQUAL_HEX8(0xCD, recordFrame.message.data[1]);
+}
+
+void test_can_record_format_preserves_channel_and_payload(void) {
+    CanRxFrame frame = {};
+    frame.bus = CAN_BUS_2;
+    frame.receivedAtMs = 123;
+    frame.message.id = 0x123;
+    frame.message.isExtended = true;
+    frame.message.length = 2;
+    frame.message.data[0] = 0xA1;
+    frame.message.data[1] = 0xB2;
+
+    char line[64] = {};
+    size_t written = 0;
+    TEST_ASSERT_TRUE(ctFormatCanRecordLine(frame, line, sizeof(line), written));
+    TEST_ASSERT_EQUAL_STRING("123,CAN2,00000123,1,0,2,A1B2\n", line);
+    TEST_ASSERT_EQUAL(strlen(line), written);
+}
+
+void test_can_record_format_rejects_invalid_or_truncated_frames(void) {
+    CanRxFrame frame = {};
+    frame.bus = CAN_BUS_1;
+    frame.message.length = 9;
+    char line[64] = {};
+    size_t written = 0;
+    TEST_ASSERT_FALSE(ctFormatCanRecordLine(frame, line, sizeof(line), written));
+
+    frame.message.length = 0;
+    char tiny[4] = {};
+    TEST_ASSERT_FALSE(ctFormatCanRecordLine(frame, tiny, sizeof(tiny), written));
+}
+
+void test_can_record_filename_allowlist(void) {
+    TEST_ASSERT_TRUE(ctCanRecordFilenameValid("can0000.csv"));
+    TEST_ASSERT_TRUE(ctCanRecordFilenameValid("can9999.csv"));
+    TEST_ASSERT_FALSE(ctCanRecordFilenameValid("/can0000.csv"));
+    TEST_ASSERT_FALSE(ctCanRecordFilenameValid("can00x0.csv"));
+    TEST_ASSERT_FALSE(ctCanRecordFilenameValid("can0000.csv/../config"));
+    TEST_ASSERT_FALSE(ctCanRecordFilenameValid("custom.csv"));
+}
+
 void test_can_service_bounds_consumer_queues_and_counts_drops(void) {
     MockCanInterface can1;
     MockCanInterface can2;
@@ -338,6 +436,23 @@ void test_obd_rejects_wrong_service_or_pid(void) {
     TEST_ASSERT_FALSE(ctParseObdSingleFrame(frame, 8, 0x41, 0x0C, p));
     TEST_ASSERT_FALSE(ctParseObdSingleFrame(frame, 8, 0x43, 0xFF, p));
 }
+void test_obd_clear_dtc_requires_positive_ecu_ack(void) {
+    const uint8_t positive[] = {0x01, 0x44, 0, 0, 0, 0, 0, 0};
+    const uint8_t negative[] = {0x03, 0x7F, 0x04, 0x22, 0, 0, 0, 0};
+    const uint8_t wrongService[] = {0x03, 0x7F, 0x03, 0x22, 0, 0, 0, 0};
+    const uint8_t malformed[] = {0x02, 0x7F, 0x04, 0, 0, 0, 0, 0};
+    uint8_t responseCode = 0;
+
+    TEST_ASSERT_TRUE(ctParseObdPositiveServiceAck(positive, sizeof(positive), 0x44));
+    TEST_ASSERT_FALSE(ctParseObdPositiveServiceAck(positive, sizeof(positive), 0x43));
+    TEST_ASSERT_TRUE(ctParseObdNegativeResponse(negative, sizeof(negative), 0x04,
+                                               responseCode));
+    TEST_ASSERT_EQUAL_HEX8(0x22, responseCode);
+    TEST_ASSERT_FALSE(ctParseObdNegativeResponse(wrongService, sizeof(wrongService),
+                                                0x04, responseCode));
+    TEST_ASSERT_FALSE(ctParseObdNegativeResponse(malformed, sizeof(malformed),
+                                                0x04, responseCode));
+}
 void test_dtc_response_and_padding(void) {
     const uint8_t frame[] = {0x07, 0x43, 0x01, 0x23, 0x00, 0x00, 0x00, 0x00};
     CtObdSingleFrame p;
@@ -353,6 +468,33 @@ void test_dtc_response_and_padding(void) {
     TEST_ASSERT_TRUE(ctParseObdSingleFrame(noDtc, sizeof(noDtc), 0x43, 0xFF, p));
     TEST_ASSERT_EQUAL(0, p.pid);
     TEST_ASSERT_EQUAL(2, p.dataOffset);
+}
+void test_obd_dtc_payload_parsing(void) {
+    const uint8_t payload[] = {0x43, 0x01, 0x23, 0x00, 0x00, 0xA4, 0x56};
+    uint16_t codes[2] = {};
+    uint8_t count = 0;
+    TEST_ASSERT_TRUE(ctParseObdDtcPayload(payload, sizeof(payload), codes, 2, count));
+    TEST_ASSERT_EQUAL(2, count);
+    TEST_ASSERT_EQUAL_HEX16(0x0123, codes[0]);
+    TEST_ASSERT_EQUAL_HEX16(0xA456, codes[1]);
+
+    const uint8_t malformed[] = {0x43, 0x01, 0x23, 0x45};
+    TEST_ASSERT_FALSE(ctParseObdDtcPayload(malformed, sizeof(malformed), codes, 2, count));
+    TEST_ASSERT_FALSE(ctParseObdDtcPayload(payload, sizeof(payload), codes, 0, count));
+}
+void test_isotp_flow_control_frame_validation(void) {
+    uint8_t frame[8] = {};
+    TEST_ASSERT_TRUE(ctBuildIsoTpFlowControl(frame, sizeof(frame), 0, 0, 0));
+    TEST_ASSERT_EQUAL_HEX8(0x30, frame[0]);
+    TEST_ASSERT_EQUAL(0, frame[1]);
+    TEST_ASSERT_EQUAL(0, frame[2]);
+    TEST_ASSERT_TRUE(ctBuildIsoTpFlowControl(frame, sizeof(frame), 1, 4, 0xF3));
+    TEST_ASSERT_EQUAL_HEX8(0x31, frame[0]);
+    TEST_ASSERT_EQUAL(4, frame[1]);
+    TEST_ASSERT_EQUAL_HEX8(0xF3, frame[2]);
+    TEST_ASSERT_FALSE(ctBuildIsoTpFlowControl(frame, 7, 0, 0, 0));
+    TEST_ASSERT_FALSE(ctBuildIsoTpFlowControl(frame, sizeof(frame), 3, 0, 0));
+    TEST_ASSERT_FALSE(ctBuildIsoTpFlowControl(frame, sizeof(frame), 0, 0, 0x80));
 }
 void test_isotp_multiframe_reassembly_and_sequence_validation(void) {
     const uint8_t first[] = {0x10, 0x07, 0x43, 0x01, 0x23, 0x04, 0x56, 0x07};
@@ -500,6 +642,11 @@ int main(int, char**) {
     RUN_TEST(test_can_service_routes_legacy_calls_to_can1);
     RUN_TEST(test_can_service_does_not_fallback_from_selected_inactive_bus);
     RUN_TEST(test_can_service_fans_out_frames_to_independent_subscribers);
+    RUN_TEST(test_can_service_pumps_both_buses_independently);
+    RUN_TEST(test_can_service_fans_out_to_monitor_and_recorder);
+    RUN_TEST(test_can_record_format_preserves_channel_and_payload);
+    RUN_TEST(test_can_record_format_rejects_invalid_or_truncated_frames);
+    RUN_TEST(test_can_record_filename_allowlist);
     RUN_TEST(test_can_service_bounds_consumer_queues_and_counts_drops);
     RUN_TEST(test_bounded_index_parser_rejects_wraparound);
     RUN_TEST(test_strict_decimal_and_boolean_parsing);
@@ -510,7 +657,10 @@ int main(int, char**) {
     RUN_TEST(test_obd_reply_requires_standard_data_frame);
     RUN_TEST(test_obd_rejects_inconsistent_dlc_and_pci);
     RUN_TEST(test_obd_rejects_wrong_service_or_pid);
+    RUN_TEST(test_obd_clear_dtc_requires_positive_ecu_ack);
     RUN_TEST(test_dtc_response_and_padding);
+    RUN_TEST(test_obd_dtc_payload_parsing);
+    RUN_TEST(test_isotp_flow_control_frame_validation);
     RUN_TEST(test_isotp_multiframe_reassembly_and_sequence_validation);
     RUN_TEST(test_isotp_rejects_invalid_first_frame);
     RUN_TEST(test_dbc_intel_boundaries);
