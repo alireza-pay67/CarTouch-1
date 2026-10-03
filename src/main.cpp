@@ -397,6 +397,12 @@ void setup() {
 // □□□□□□□□□□ loop()
 // ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
 
+// Last Bus-Off state of CAN1/CAN2, refreshed once per second in loop() and
+// read by refreshModuleStatuses() so the status code adds no extra bus access.
+static bool g_canBusOff[2] = {false, false};
+// A channel counts as "connected" only if a frame arrived within this time.
+static const uint32_t CAN_LINK_TRAFFIC_TIMEOUT_MS = 5000;
+
 void loop() {
     // Feed the watchdog every iteration.
     esp_task_wdt_reset();
@@ -436,30 +442,37 @@ void loop() {
 
     static uint32_t lastCanDiagnosticsBroadcast = 0;
     if ((uint32_t)(millis() - lastCanDiagnosticsBroadcast) >= 1000) {
-        CanDiagnostics diagnostics = {};
-        canManager.getDiagnostics(CAN_BUS_1, diagnostics);
-        webServer.broadcastCanDiagnostics(diagnostics, "CAN1");
-
-        static bool can2BusOffSeen = false;
-        static uint32_t lastCan2Recovery = 0;
-        diagnostics = {};
-        canManager.getDiagnostics(CAN_BUS_2, diagnostics);
-        if (diagnostics.busOff) {
-            const uint32_t now = millis();
-            if (!can2BusOffSeen || (uint32_t)(now - lastCan2Recovery) >= 5000) {
-                getErrorLog()->log(LOG_CAT_CAN, LOG_ERROR, "CAN2 MCP2515 bus-off detected; attempting recovery");
-                if (!canManager.recoverFromBusOff(CAN_BUS_2)) {
-                    getErrorLog()->log(LOG_CAT_CAN, LOG_WARN, "CAN2 MCP2515 recovery failed; retrying in 5 seconds");
+        // Bus-Off is checked and recovered on BOTH channels. Before, CAN1
+        // (TWAI) was only recovered after a failed transmit, so a Bus-Off
+        // that happened without further TX was never cleared.
+        static bool     busOffSeen[2]     = {false, false};
+        static uint32_t lastRecovery[2]   = {0, 0};
+        static const char* const busName[2] = {"CAN1", "CAN2"};
+        for (uint8_t b = 0; b < 2; ++b) {
+            const CanBusId bus = (b == 0) ? CAN_BUS_1 : CAN_BUS_2;
+            CanDiagnostics diagnostics = {};
+            canManager.getDiagnostics(bus, diagnostics);
+            g_canBusOff[b] = diagnostics.busOff;
+            if (diagnostics.busOff) {
+                const uint32_t now = millis();
+                if (ctRecoveryDue(busOffSeen[b], lastRecovery[b], now, 5000)) {
+                    getErrorLog()->log(LOG_CAT_CAN, LOG_ERROR,
+                                       "%s bus-off detected; attempting recovery", busName[b]);
+                    if (!canManager.recoverFromBusOff(bus)) {
+                        getErrorLog()->log(LOG_CAT_CAN, LOG_WARN,
+                                           "%s recovery failed; retrying in 5 seconds", busName[b]);
+                    }
+                    busOffSeen[b]   = true;
+                    lastRecovery[b] = now;
+                    diagnostics = {};
+                    canManager.getDiagnostics(bus, diagnostics);
+                    g_canBusOff[b] = diagnostics.busOff;
                 }
-                can2BusOffSeen = true;
-                lastCan2Recovery = now;
-                diagnostics = {};
-                canManager.getDiagnostics(CAN_BUS_2, diagnostics);
+            } else {
+                busOffSeen[b] = false;
             }
-        } else {
-            can2BusOffSeen = false;
+            webServer.broadcastCanDiagnostics(diagnostics, busName[b]);
         }
-        webServer.broadcastCanDiagnostics(diagnostics, "CAN2");
         lastCanDiagnosticsBroadcast = millis();
     }
 
@@ -1037,6 +1050,16 @@ void handleControlCommand(const char* command) {
     }
 }
 
+static ModuleState canLinkToModuleState(CtCanLinkState link) {
+    switch (link) {
+        case CT_LINK_TRAFFIC:    return MODULE_READY;
+        case CT_LINK_NO_TRAFFIC: return MODULE_UNVERIFIED;
+        case CT_LINK_BUS_OFF:
+        case CT_LINK_DOWN:
+        default:                 return MODULE_ERROR;
+    }
+}
+
 void refreshModuleStatuses() {
     static uint32_t lastCheck = 0;
     static ModuleState lastStates[MODULE_COUNT] = {};
@@ -1044,10 +1067,19 @@ void refreshModuleStatuses() {
     if (now - lastCheck < 500) return;
     lastCheck = now;
 
+    // Real traffic decides "connected"; a started driver alone is UNVERIFIED.
+    const CtCanLinkState can1Link = ctCanLinkState(
+        canManager.isActive(CAN_BUS_1), g_canBusOff[0],
+        canManager.getLastRxTime(CAN_BUS_1), now, CAN_LINK_TRAFFIC_TIMEOUT_MS);
+    const CtCanLinkState can2Link = ctCanLinkState(
+        canManager.isActive(CAN_BUS_2), g_canBusOff[1],
+        canManager.getLastRxTime(CAN_BUS_2), now, CAN_LINK_TRAFFIC_TIMEOUT_MS);
+
     const ModuleState states[MODULE_COUNT] = {
         (wifiManager.isEnabled() && wifiManager.isConnected()) ? MODULE_READY : (wifiManager.isEnabled() ? MODULE_ERROR : MODULE_DISABLED),
         webServer.isStarted() ? MODULE_READY : MODULE_ERROR,
-        (canManager.isActive(CAN_BUS_1) || canManager.isActive(CAN_BUS_2)) ? MODULE_UNVERIFIED : MODULE_ERROR,
+        (can1Link == CT_LINK_TRAFFIC || can2Link == CT_LINK_TRAFFIC) ? MODULE_READY
+            : ((can1Link == CT_LINK_NO_TRAFFIC || can2Link == CT_LINK_NO_TRAFFIC) ? MODULE_UNVERIFIED : MODULE_ERROR),
         !canManager.isActive(obd2Reader.getCanBus()) ? MODULE_ERROR :
             (!obd2Reader.canTransmit() ? MODULE_DISABLED : MODULE_UNVERIFIED),
     #ifdef CARTOUCH_HEADLESS
@@ -1059,8 +1091,8 @@ void refreshModuleStatuses() {
     #endif
         bleManager.isEnabled() ? MODULE_READY : MODULE_ERROR,
         (filesystemReady && customVehicleStoreReady) ? MODULE_READY : MODULE_ERROR,
-        canManager.isActive(CAN_BUS_1) ? MODULE_UNVERIFIED : MODULE_ERROR,
-        canManager.isActive(CAN_BUS_2) ? MODULE_UNVERIFIED : MODULE_ERROR,
+        canLinkToModuleState(can1Link),
+        canLinkToModuleState(can2Link),
         // Not every board has PSRAM; its absence is normal, not an error.
         (ESP.getPsramSize() > 0) ? MODULE_READY : MODULE_NOT_PRESENT,
         // SD card and physical buttons are not implemented yet: reported as
