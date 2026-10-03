@@ -16,6 +16,8 @@
 #include "ct_can_config.h"
 #include "ct_storage_guard.h"
 #include <SPIFFS.h>
+#include <SD.h>
+#include "sd_storage.h"
 #include <esp_random.h>
 #include <Update.h>
 #include "ct_password.h"
@@ -561,6 +563,31 @@ void WebServerManager::begin(uint16_t port) {
         _handleAPIStatus(request);
     });
 
+    // SD pin and per-category storage choice. Authenticated like all settings.
+    // POST csPin=<gpio|-1>  or  category=<db|rec|prof|bak>&choice=<auto|internal|sd>
+    //   or reset=1 (all choices back to auto).
+    _server.on("/api/storage", HTTP_POST, [this](AsyncWebServerRequest* request) {
+        if (!_authenticate(request)) return;
+        bool ok = false;
+        if (request->hasArg("reset")) {
+            resetStorageChoices();
+            ok = true;
+        } else if (request->hasArg("csPin")) {
+            char* end = nullptr;
+            const String v = request->arg("csPin");
+            const long pin = strtol(v.c_str(), &end, 10);
+            ok = (end != v.c_str() && *end == '\0' && pin >= -1 && pin <= 48) &&
+                 sdStorage.setCsPin((int)pin);
+        } else if (request->hasArg("category") && request->hasArg("choice")) {
+            const String ch = request->arg("choice");
+            const uint8_t v = ch == "auto" ? CT_STORE_AUTO : ch == "internal" ? CT_STORE_INTERNAL :
+                              ch == "sd" ? CT_STORE_SD : 255;
+            ok = setStorageChoice(request->arg("category").c_str(), v);
+        }
+        request->send(ok ? 200 : 400, "application/json",
+                      ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"Invalid or rejected storage setting\"}");
+    });
+
     // Checklist item 16 (error logging/telemetry) - read-only, same
     // auth level as everything else. See error_log.h.
     _server.on("/api/logs", HTTP_GET, [this](AsyncWebServerRequest* request) {
@@ -578,33 +605,42 @@ void WebServerManager::begin(uint16_t port) {
 
     _server.on("/api/recordings", HTTP_GET, [this](AsyncWebServerRequest* request) {
         if (!_authenticate(request)) return;
+        const bool sdReady = sdStorage.state() == SdStorage::READY;
         File root = SPIFFS.open("/");
-        if (!root) {
-            request->send(503, "application/json", "{\"error\":\"SPIFFS unavailable\"}");
+        if (!root && !sdReady) {
+            request->send(503, "application/json", "{\"error\":\"No storage available\"}");
             return;
         }
 
         JsonDocument doc;
         JsonArray recordings = doc["recordings"].to<JsonArray>();
-        File entry = root.openNextFile();
         uint8_t count = 0;
-        uint16_t scanned = 0;
-        while (entry && count < 50 && scanned < 200) {
-            ++scanned;
-            String name = entry.name();
-            if (name.startsWith("/")) name.remove(0, 1);
-            if (ctCanRecordFilenameValid(name.c_str())) {
-                JsonObject item = recordings.add<JsonObject>();
-                item["name"] = name;
-                item["bytes"] = entry.size();
-                ++count;
+        bool truncated = false;
+        // Internal flash first, then SD. Names are unique across both.
+        for (uint8_t pass = 0; pass < 2; ++pass) {
+            File dir = (pass == 0) ? root : (sdReady ? SD.open("/") : File());
+            if (!dir) continue;
+            const char* locName = pass == 0 ? "internal" : "sd";
+            File entry = dir.openNextFile();
+            uint16_t scanned = 0;
+            while (entry && count < 50 && scanned < 200) {
+                ++scanned;
+                String name = entry.name();
+                if (name.startsWith("/")) name.remove(0, 1);
+                if (!entry.isDirectory() && ctCanRecordFilenameValid(name.c_str())) {
+                    JsonObject item = recordings.add<JsonObject>();
+                    item["name"] = name;
+                    item["bytes"] = entry.size();
+                    item["location"] = locName;
+                    ++count;
+                }
+                entry.close();
+                entry = dir.openNextFile();
             }
+            if (entry) truncated = true;
             entry.close();
-            entry = root.openNextFile();
+            dir.close();
         }
-        const bool truncated = (bool)entry;
-        entry.close();
-        root.close();
         doc["truncated"] = truncated;
 
         String json;
@@ -625,11 +661,14 @@ void WebServerManager::begin(uint16_t port) {
                 return;
             }
             const String path = String("/") + name;
-            if (!SPIFFS.exists(path)) {
+            fs::FS* source = nullptr;
+            if (SPIFFS.exists(path)) source = &SPIFFS;
+            else if (sdStorage.state() == SdStorage::READY && SD.exists(path)) source = &SD;
+            if (!source) {
                 request->send(404, "application/json", "{\"error\":\"Recording not found\"}");
                 return;
             }
-            AsyncWebServerResponse* response = request->beginResponse(SPIFFS, path, "text/csv");
+            AsyncWebServerResponse* response = request->beginResponse(*source, path, "text/csv");
             response->addHeader("Content-Disposition", String("attachment; filename=\"") + name + "\"");
             request->send(response);
         });
@@ -1946,6 +1985,20 @@ void WebServerManager::_handleAPIStatus(AsyncWebServerRequest* request) {
     doc["obdCanBus"] = cfg->obdCanBus;
     doc["learnCanBus"] = cfg->learnCanBus;
     doc["vehicleCanBus"] = cfg->vehicleCanBus;
+
+    {
+        JsonObject sd = doc["sd"].to<JsonObject>();
+        sd["state"] = sdStorage.stateText();
+        sd["csPin"] = sdStorage.csPin();
+        sd["totalBytes"] = (uint64_t)sdStorage.totalBytes();
+        sd["freeBytes"] = (uint64_t)sdStorage.freeBytes();
+        JsonObject st = doc["storageChoice"].to<JsonObject>();
+        static const char* cats[] = { "db", "rec", "prof", "bak" };
+        for (const char* c : cats) {
+            const CtStorageChoice ch = getStorageChoice(c);
+            st[c] = ch == CT_STORE_SD ? "sd" : (ch == CT_STORE_INTERNAL ? "internal" : "auto");
+        }
+    }
 
     if (_moduleStatus) {
         JsonArray modules = doc["modules"].to<JsonArray>();

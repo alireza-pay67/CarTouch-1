@@ -1,6 +1,8 @@
 #include "can_recorder.h"
 
 #include <SPIFFS.h>
+#include <SD.h>
+#include "sd_storage.h"
 
 #include "ct_can_record.h"
 #include "ct_time.h"
@@ -23,10 +25,6 @@ bool CanRecorder::start(uint8_t busMask) {
         _lastError = "A recording is already active";
         return false;
     }
-    if (!_storageAvailable || SPIFFS.totalBytes() == 0) {
-        _lastError = "SPIFFS is unavailable";
-        return false;
-    }
     if (busMask == 0 || (busMask & (uint8_t)~BUS_MASK_BOTH) != 0) {
         _lastError = "Invalid CAN bus selection";
         return false;
@@ -39,10 +37,34 @@ bool CanRecorder::start(uint8_t busMask) {
         }
     }
 
-    const uint32_t total = SPIFFS.totalBytes();
-    const uint32_t used = SPIFFS.usedBytes();
-    if (used >= total || total - used < MIN_FREE_BYTES + sizeof(CAN_RECORD_HEADER)) {
-        _lastError = "Insufficient free SPIFFS space";
+    // Pick internal flash or SD by the stored choice for recordings.
+    {
+        const bool intOk = _storageAvailable && SPIFFS.totalBytes() > 0;
+        const uint32_t intFree = intOk ? (uint32_t)(SPIFFS.totalBytes() - SPIFFS.usedBytes()) : 0;
+        const bool sdOk = sdStorage.state() == SdStorage::READY;
+        const uint64_t sdFree64 = sdStorage.freeBytes();
+        const uint32_t sdFree = sdFree64 > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)sdFree64;
+        CtStorageDecision d = ctResolveStorage(getStorageChoice("rec"), intOk, intFree,
+                                               sdOk, sdFree, MAX_RECORDING_BYTES);
+        _notice = "";
+        if (d.loc == CT_LOC_NONE && intOk && intFree >= MIN_FREE_BYTES + sizeof(CAN_RECORD_HEADER)) {
+            // Not room for a full-size file, but keep the old behaviour: record
+            // internally until the free-space guard stops it.
+            d.loc = CT_LOC_INTERNAL;
+        }
+        if (d.loc == CT_LOC_NONE) {
+            _lastError = "No storage with enough free space (internal full, SD missing or full)";
+            return false;
+        }
+        if (d.fellBack) {
+            _notice = d.loc == CT_LOC_SD ? "Internal storage unavailable; recording to SD card"
+                                         : "SD card unavailable; recording to internal storage";
+        }
+        _loc = d.loc;
+        _fs = (_loc == CT_LOC_SD) ? (fs::FS*)&SD : (fs::FS*)&SPIFFS;
+    }
+    if (_freeBytes() < MIN_FREE_BYTES + sizeof(CAN_RECORD_HEADER)) {
+        _lastError = "Insufficient free storage space";
         return false;
     }
 
@@ -50,7 +72,10 @@ bool CanRecorder::start(uint8_t busMask) {
     bool foundName = false;
     for (uint16_t index = 0; index < MAX_RECORDING_FILES; ++index) {
         snprintf(fileName, sizeof(fileName), "/can%04u.csv", (unsigned)index);
-        if (!SPIFFS.exists(fileName)) {
+        // Unique across internal AND SD so delete/download need no location.
+        const bool onInternal = _storageAvailable && SPIFFS.exists(fileName);
+        const bool onSd = sdStorage.state() == SdStorage::READY && SD.exists(fileName);
+        if (!onInternal && !onSd) {
             foundName = true;
             break;
         }
@@ -60,7 +85,7 @@ bool CanRecorder::start(uint8_t busMask) {
         return false;
     }
 
-    _file = SPIFFS.open(fileName, FILE_WRITE);
+    _file = _fs->open(fileName, FILE_WRITE);
     if (!_file) {
         _lastError = "Could not create recording file";
         return false;
@@ -68,7 +93,7 @@ bool CanRecorder::start(uint8_t busMask) {
     if (_file.write(reinterpret_cast<const uint8_t*>(CAN_RECORD_HEADER),
                     sizeof(CAN_RECORD_HEADER) - 1u) != sizeof(CAN_RECORD_HEADER) - 1u) {
         _file.close();
-        SPIFFS.remove(fileName);
+        _fs->remove(fileName);
         _lastError = "Could not write recording header";
         return false;
     }
@@ -85,7 +110,7 @@ bool CanRecorder::start(uint8_t busMask) {
             _canService.unsubscribeRx(CAN_BUS_1, CAN_RX_RECORDER);
             _canService.unsubscribeRx(CAN_BUS_2, CAN_RX_RECORDER);
             _file.close();
-            SPIFFS.remove(fileName);
+            _fs->remove(fileName);
             _busMask = 0;
             _lastError = "Could not subscribe to CAN receive queue";
             return false;
@@ -106,8 +131,10 @@ bool CanRecorder::stop() {
 }
 
 bool CanRecorder::deleteRecording(const char* fileName) {
-    if (!_storageAvailable || !SPIFFS.totalBytes()) {
-        _lastError = "SPIFFS is unavailable";
+    const bool intOk = _storageAvailable && SPIFFS.totalBytes() > 0;
+    const bool sdOk = sdStorage.state() == SdStorage::READY;
+    if (!intOk && !sdOk) {
+        _lastError = "No storage is available";
         return false;
     }
     if (!ctCanRecordFilenameValid(fileName)) {
@@ -119,7 +146,10 @@ bool CanRecorder::deleteRecording(const char* fileName) {
         _lastError = "Stop the active recording before deleting it";
         return false;
     }
-    if (!SPIFFS.exists(path) || !SPIFFS.remove(path)) {
+    bool removed = false;
+    if (intOk && SPIFFS.exists(path)) removed = SPIFFS.remove(path);
+    else if (sdOk && SD.exists(path)) removed = SD.remove(path);
+    if (!removed) {
         _lastError = "Could not delete recording";
         return false;
     }
@@ -128,16 +158,28 @@ bool CanRecorder::deleteRecording(const char* fileName) {
     return true;
 }
 
+uint64_t CanRecorder::_totalBytes() const {
+    return _loc == CT_LOC_SD ? SD.totalBytes() : SPIFFS.totalBytes();
+}
+
+uint64_t CanRecorder::_freeBytes() const {
+    const uint64_t total = _totalBytes();
+    const uint64_t used = _loc == CT_LOC_SD ? SD.usedBytes() : SPIFFS.usedBytes();
+    return used >= total ? 0 : total - used;
+}
+
 void CanRecorder::update() {
     if (!_recording) return;
 
     const uint32_t now = millis();
     if (ctElapsedAtLeast(now, _lastSpaceCheckMs, FREE_SPACE_CHECK_MS)) {
         _lastSpaceCheckMs = now;
-        const uint32_t total = SPIFFS.totalBytes();
-        const uint32_t used = SPIFFS.usedBytes();
-        if (used >= total || total - used < MIN_FREE_BYTES) {
-            _fail("Recording stopped to preserve remaining SPIFFS space");
+        if (_loc == CT_LOC_SD && sdStorage.state() != SdStorage::READY) {
+            _fail("SD card removed; recording stopped (data on the card may be incomplete)");
+            return;
+        }
+        if (_freeBytes() < MIN_FREE_BYTES) {
+            _fail("Recording stopped to preserve remaining free space");
             return;
         }
     }

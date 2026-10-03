@@ -3,6 +3,7 @@
 #include <NimBLEDevice.h>
 #include <Update.h>
 #include "ct_password.h"
+#include "sd_storage.h"
 #include "config.h"
 #include "ct_can_record.h"
 #include "ct_time.h"
@@ -279,6 +280,47 @@ void BLEManager::_handleCommand(const String& command, uint16_t connHandle) {
             return;
         }
         _sendStatus("COMMAND_QUEUED", connHandle);
+        return;
+    }
+
+    if (cmd.startsWith("SD:") || cmd.startsWith("sd:")) {
+        if (!_commandAuthenticated || _commandConnHandle != connHandle) {
+            _sendStatus("COMMAND_AUTH_REQUIRED", connHandle);
+            return;
+        }
+        // SD:STATUS | SD:CS:<gpio|-1> | SD:STORE:<db|rec|prof|bak>:<auto|internal|sd> | SD:RESET
+        String arg = cmd.substring(3);
+        if (arg.equalsIgnoreCase("STATUS")) {
+            String r = "SD:" + String(sdStorage.stateText()) + ":CS=" + String(sdStorage.csPin()) +
+                       ":FREE=" + String((uint32_t)(sdStorage.freeBytes() / 1024)) + "K";
+            _sendStatus(r.c_str(), connHandle);
+        } else if (arg.equalsIgnoreCase("RESET")) {
+            resetStorageChoices();
+            _sendStatus("SD_OK", connHandle);
+        } else if (arg.startsWith("CS:") || arg.startsWith("cs:")) {
+            const String v = arg.substring(3);
+            char* end = nullptr;
+            const long pin = strtol(v.c_str(), &end, 10);
+            const bool ok = end != v.c_str() && *end == '\0' && pin >= -1 && pin <= 48 &&
+                            sdStorage.setCsPin((int)pin);
+            _sendStatus(ok ? "SD_OK" : "SD_REJECTED", connHandle);
+        } else if (arg.startsWith("STORE:") || arg.startsWith("store:")) {
+            const String rest = arg.substring(6);
+            const int sep = rest.indexOf(':');
+            bool ok = false;
+            if (sep > 0) {
+                const String ch = rest.substring(sep + 1);
+                const uint8_t v = ch.equalsIgnoreCase("auto") ? CT_STORE_AUTO :
+                                  ch.equalsIgnoreCase("internal") ? CT_STORE_INTERNAL :
+                                  ch.equalsIgnoreCase("sd") ? CT_STORE_SD : 255;
+                String cat = rest.substring(0, sep);
+                cat.toLowerCase();
+                ok = setStorageChoice(cat.c_str(), v);
+            }
+            _sendStatus(ok ? "SD_OK" : "SD_REJECTED", connHandle);
+        } else {
+            _sendStatus("COMMAND_BAD_REQUEST", connHandle);
+        }
         return;
     }
 

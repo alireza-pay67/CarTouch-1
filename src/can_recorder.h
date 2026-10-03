@@ -5,6 +5,7 @@
 #include <FS.h>
 
 #include "can_service.h"
+#include "ct_storage_policy.h"
 
 class CanRecorder {
 public:
@@ -28,6 +29,9 @@ public:
     uint32_t getDroppedFrameCount() const { return _droppedFrameCount; }
     const char* getFileName() const { return _lastFileName.c_str(); }
     const char* getLastError() const { return _lastError.c_str(); }
+    // Where the active/last recording went and why (e.g. fallback notice).
+    const char* getLocationText() const { return _loc == CT_LOC_SD ? "sd" : "internal"; }
+    const char* getNotice() const { return _notice.c_str(); }
 
 private:
     static const uint32_t MIN_FREE_BYTES = 1024;
@@ -45,6 +49,11 @@ private:
     uint32_t _lastSpaceCheckMs;
     String _lastFileName;
     String _lastError;
+    String _notice;
+    fs::FS* _fs = nullptr;
+    CtStorageLoc _loc = CT_LOC_INTERNAL;
+    uint64_t _freeBytes() const;
+    uint64_t _totalBytes() const;
 
     void _closeFile();
     void _fail(const char* error);

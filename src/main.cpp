@@ -11,6 +11,7 @@
 #include <SPIFFS.h>
 #include <esp_task_wdt.h>
 #include "sd_storage.h"
+#include "buttons.h"
 
 #include "config.h"
 #include "ct_can_config.h"
@@ -289,6 +290,9 @@ void setup() {
     sdStorage.begin();
     Serial.printf("[INIT] SD: %s\n", sdStorage.stateText());
 
+    // 3c. Optional physical keys (disabled until configured)
+    buttons.begin();
+
     // 4. OBD-II reader
     moduleStatusManager.setState(MODULE_OBD, MODULE_INITIALIZING);
     obd2Reader.setCanBus(getConfig()->obdCanBus == 1 ? CAN_BUS_2 : CAN_BUS_1);
@@ -418,6 +422,15 @@ void loop() {
     canManager.pumpRx();
     canRecorder.update();
     sdStorage.update();
+    buttons.update();
+    {
+        CtKeyEvent keyEv;
+        while (buttons.poll(keyEv)) {
+            // Short press = navigate; long press only has a meaning for OK (back).
+            if (keyEv.type == CT_EV_SHORT || (keyEv.type == CT_EV_LONG && keyEv.key == CT_KEY_OK))
+                tftUI.pushKey(keyEv.key, keyEv.type == CT_EV_LONG);
+        }
+    }
     bool canWakeActivity = false;
     CanRxFrame wakeFrame;
     while (canManager.receiveRx(CAN_BUS_1, CAN_RX_WAKE, wakeFrame)) {
@@ -598,7 +611,7 @@ static const char* learnStateName(LearnModeState state) {
 
 void processSerialCommand(const char* command) {
     if (strcmp(command, "help") == 0) {
-        Serial.println("Commands: help | status | config | can | obd | dtc read | dtc clear | dtc status | learn | record status | record start <1|2|both> | record stop | record delete <canNNNN.csv> | storage | sd status | sd cs <gpio|-1> | sd store <cat> <auto|internal|sd> | sd reset | errors | control <command>");
+        Serial.println("Commands: help | status | config | can | obd | dtc read | dtc clear | dtc status | learn | record status | record start <1|2|both> | record stop | record delete <canNNNN.csv> | storage | sd status | sd cs <gpio|-1> | sd store <cat> <auto|internal|sd> | sd reset | btn status | btn off | btn gpio u d l r ok | btn adc pin u d l r ok | errors | control <command>");
         Serial.println("Control commands use the same selected-profile, verification, Listen-Only, and rate-limit guards as Web/TFT.");
         return;
     }
@@ -753,6 +766,37 @@ void processSerialCommand(const char* command) {
         Serial.println("Usage: sd store <db|rec|prof|bak> <auto|internal|sd>");
         return;
     }
+    if (strcmp(command, "btn status") == 0) {
+        Serial.printf("Buttons mode=%s everPressed=%s invalidAdcReads=%lu\n",
+                      buttons.mode() == Buttons::GPIO_MODE ? "gpio" : buttons.mode() == Buttons::ADC_MODE ? "adc" : "off",
+                      buttons.everPressed() ? "yes" : "no (unverified)", (unsigned long)buttons.invalidReads());
+        Serial.printf("  gpio pins U/D/L/R/OK: %d %d %d %d %d | adc pin: %d | ladder: %u %u %u %u %u\n",
+                      buttons.pin(0), buttons.pin(1), buttons.pin(2), buttons.pin(3), buttons.pin(4), buttons.adcPin(),
+                      buttons.ladder()[0], buttons.ladder()[1], buttons.ladder()[2], buttons.ladder()[3], buttons.ladder()[4]);
+        return;
+    }
+    if (strcmp(command, "btn off") == 0) {
+        Serial.println(buttons.setOff() ? "Buttons disabled" : "Could not save");
+        return;
+    }
+    if (strncmp(command, "btn gpio ", 9) == 0) {
+        int p[5];
+        if (sscanf(command + 9, "%d %d %d %d %d", &p[0], &p[1], &p[2], &p[3], &p[4]) == 5 && buttons.setGpioPins(p))
+            Serial.println("GPIO buttons saved (state stays UNVERIFIED until a key is pressed)");
+        else
+            Serial.println("Usage: btn gpio <up> <down> <left> <right> <ok> - pins must be distinct, free and not reserved");
+        return;
+    }
+    if (strncmp(command, "btn adc ", 8) == 0) {
+        int pin; unsigned v[5];
+        if (sscanf(command + 8, "%d %u %u %u %u %u", &pin, &v[0], &v[1], &v[2], &v[3], &v[4]) == 6) {
+            uint16_t lad[5];
+            for (int i = 0; i < 5; i++) lad[i] = (uint16_t)(v[i] > 65535u ? 65535u : v[i]);
+            if (buttons.setAdc(pin, lad)) { Serial.println("ADC buttons saved"); return; }
+        }
+        Serial.println("Usage: btn adc <adc1 gpio 1-10> <up> <down> <left> <right> <ok> (raw 12-bit values, distinct, < 3900)");
+        return;
+    }
     if (strcmp(command, "sd reset") == 0) {
         resetStorageChoices();
         Serial.println("Storage choices reset to auto");
@@ -886,6 +930,7 @@ void processCommand(const char* command) {
     }
 
     if (strcmp(command, "record_status") == 0) {
+        Serial.printf("[RECORDER] storage=%s notice=%s\n", canRecorder.getLocationText(), canRecorder.getNotice());
         Serial.printf("[RECORDER] recording=%s buses=%u frames=%lu dropped=%lu file=%s error=%s\n",
                       canRecorder.isRecording() ? "active" : "stopped",
                       canRecorder.getBusMask(),
@@ -1146,8 +1191,10 @@ void refreshModuleStatuses() {
         (sdStorage.state() == SdStorage::READY) ? MODULE_READY :
             (sdStorage.state() == SdStorage::ERROR_STATE ? MODULE_ERROR :
             (sdStorage.state() == SdStorage::DISABLED ? MODULE_DISABLED : MODULE_NOT_PRESENT)),
-        // Physical buttons: driver not implemented yet.
-        MODULE_NOT_PRESENT
+        // Buttons: DISABLED = not configured; UNVERIFIED until a real press is
+        // seen (a key that was never pressed looks identical to "not wired").
+        buttons.mode() == Buttons::OFF ? MODULE_DISABLED :
+            (buttons.everPressed() ? MODULE_READY : MODULE_UNVERIFIED)
     };
     bool changed = false;
     for (uint8_t i = 0; i < MODULE_COUNT; ++i) {

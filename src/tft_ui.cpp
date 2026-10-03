@@ -11,6 +11,7 @@
  */
 
 #include "tft_ui.h"
+#include "ct_buttons.h"
 #include "learn_engine.h"
 #include "custom_vehicle_store.h"
 #include "active_profile_manager.h"
@@ -69,6 +70,72 @@ void TFT_UI::_lvglTouchRead(lv_indev_drv_t* drv, lv_indev_data_t* data) {
         data->state = LV_INDEV_STATE_REL;
     }
 }
+
+// ○○○○○○○○○○○○○○○○○○○○○○○○○○○○○○
+// ○○○○○○○○○○ Physical keys (LVGL keypad input)
+// ○○○○○○○○○○○○○○○○○○○○○○○○○○○○○○
+
+// Small ring of pending key presses; each entry is delivered as press+release.
+static uint32_t s_keyQueue[8];
+static uint8_t  s_keyHead = 0, s_keyCount = 0;
+static bool     s_keyReleasePending = false;
+static uint32_t s_keyLast = 0;
+static int8_t   s_keyDir = 1;   // last navigation direction, used to skip hidden objects
+
+void TFT_UI::pushKey(uint8_t ctKey, bool longPress) {
+    uint32_t lv = 0;
+    switch (ctKey) {
+        case CT_KEY_UP:    lv = LV_KEY_PREV; s_keyDir = -1; break;
+        case CT_KEY_DOWN:  lv = LV_KEY_NEXT; s_keyDir = 1;  break;
+        case CT_KEY_LEFT:  lv = LV_KEY_LEFT;  break;
+        case CT_KEY_RIGHT: lv = LV_KEY_RIGHT; break;
+        case CT_KEY_OK:    lv = longPress ? LV_KEY_ESC : LV_KEY_ENTER; break;
+        default: return;
+    }
+    if (!_initialized || s_keyCount >= 8) return;
+    s_keyQueue[(s_keyHead + s_keyCount) % 8] = lv;
+    s_keyCount++;
+}
+
+#ifndef CARTOUCH_HEADLESS
+static void keypadRead(lv_indev_drv_t*, lv_indev_data_t* data) {
+    if (s_keyReleasePending) {
+        s_keyReleasePending = false;
+        data->state = LV_INDEV_STATE_REL;
+        data->key = s_keyLast;
+        return;
+    }
+    if (s_keyCount > 0) {
+        s_keyLast = s_keyQueue[s_keyHead];
+        s_keyHead = (s_keyHead + 1) % 8;
+        s_keyCount--;
+        s_keyReleasePending = true;
+        data->state = LV_INDEV_STATE_PR;
+        data->key = s_keyLast;
+        return;
+    }
+    data->state = LV_INDEV_STATE_REL;
+    data->key = s_keyLast;
+}
+
+// Focus may land on widgets of other screens/tabs that are not visible.
+// Skip those (bounded, so a screen with nothing focusable cannot loop).
+static void keypadFocusCb(lv_group_t* g) {
+    static uint8_t depth = 0;
+    lv_obj_t* o = lv_group_get_focused(g);
+    if (!o || depth >= 24) return;
+    lv_area_t a;
+    lv_obj_get_coords(o, &a);
+    const bool visible = lv_obj_get_screen(o) == lv_scr_act() &&
+                         !lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN) &&
+                         a.x2 >= 0 && a.y2 >= 0 &&
+                         a.x1 < (lv_coord_t)TFT_WIDTH && a.y1 < (lv_coord_t)TFT_HEIGHT;
+    if (visible) return;
+    depth++;
+    if (s_keyDir < 0) lv_group_focus_prev(g); else lv_group_focus_next(g);
+    depth--;
+}
+#endif
 
 // ○○○○○○○○○○○○○○○○○○○○○○○○○○○○○○
 // ○○○○○○○○○○ Learn Mode command label options (dropdown source data)
@@ -252,6 +319,18 @@ void TFT_UI::begin() {
     indevDrv.type    = LV_INDEV_TYPE_POINTER;
     indevDrv.read_cb = _lvglTouchRead;
     lv_indev_drv_register(&indevDrv);
+
+    // Optional physical keys: keypad input device + default group, so every
+    // focusable widget created below can be reached with the 5-way keys.
+    static lv_indev_drv_t keyDrv;
+    lv_indev_drv_init(&keyDrv);
+    keyDrv.type    = LV_INDEV_TYPE_KEYPAD;
+    keyDrv.read_cb = keypadRead;
+    lv_indev_t* keyIndev = lv_indev_drv_register(&keyDrv);
+    lv_group_t* keyGroup = lv_group_create();
+    lv_group_set_default(keyGroup);
+    lv_group_set_focus_cb(keyGroup, keypadFocusCb);
+    lv_indev_set_group(keyIndev, keyGroup);
 
     // Build the UI - base tabs plus the Learn tab and its modals
     _buildTabControl();

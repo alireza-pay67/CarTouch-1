@@ -76,6 +76,13 @@ public:
     void setDeviceMode(DeviceMode mode);
 
     /**
+     * Feeds one physical-key event (CtKey from ct_buttons.h) into the UI.
+     * Safe to call even when no display is present (it is then ignored).
+     * lvKey 0 = ignore. Short press maps to navigation, long OK to ESC.
+     */
+    void pushKey(uint8_t ctKey, bool longPress);
+
+    /**
      * Runs the interactive touch calibration flow (5 points, via
      * TFT_eSPI's calibrateTouch()). The result is stored in AppConfig
      * (touchCalData/touchCalibrated) so it isn't needed again on
