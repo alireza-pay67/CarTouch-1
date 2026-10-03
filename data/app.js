@@ -477,6 +477,7 @@ async function refreshDeviceInfo(){
     const can1Speed=document.getElementById('can1-speed'); if(can1Speed && d.can1Speed) can1Speed.value=String(d.can1Speed);
     const can1Listen=document.getElementById('can1-listen-only'); if(can1Listen) can1Listen.checked=!!d.can1ListenOnly;
     const obdCanBus=document.getElementById('obd-can-bus'); if(obdCanBus && (d.obdCanBus===0 || d.obdCanBus===1)) obdCanBus.value=String(d.obdCanBus);
+    const vehicleCanBus=document.getElementById('vehicle-can-bus'); if(vehicleCanBus && (d.vehicleCanBus===0 || d.vehicleCanBus===1)) vehicleCanBus.value=String(d.vehicleCanBus);
     const learnCanBus=document.getElementById('learn-can-bus'); if(learnCanBus && (d.learnCanBus===0 || d.learnCanBus===1)) learnCanBus.value=String(d.learnCanBus);
     updateModuleStatusList(d.modules);
   }catch(e){}
@@ -500,6 +501,7 @@ function setupCanConfigForm(){
     body.append('can1ListenOnly',document.getElementById('can1-listen-only').checked?'true':'false');
     body.append('obdCanBus',document.getElementById('obd-can-bus').value);
     body.append('learnCanBus',document.getElementById('learn-can-bus').value);
+    body.append('vehicleCanBus',document.getElementById('vehicle-can-bus').value);
     try{
       const res=await fetch('/api/can-config',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()});
       const data=await res.json();

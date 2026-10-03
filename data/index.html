@@ -272,6 +272,14 @@
                         </select>
                     </label>
                     <p class="muted">OBD requests use only the selected interface. If it is unavailable or in Listen-Only mode, OBD polling stays idle; there is no automatic transmit fallback.</p>
+                    <h4>Vehicle control channel</h4>
+                    <label>Send vehicle commands on
+                        <select id="vehicle-can-bus">
+                            <option value="0">CAN1 / TWAI</option>
+                            <option value="1">CAN2 / MCP2515</option>
+                        </select>
+                    </label>
+                    <p class="muted">Vehicle commands go out on the selected interface only, and only when that interface is not in Listen-Only mode. There is no automatic fallback to the other interface.</p>
                     <h4>Learn Mode channel</h4>
                     <label>Capture from
                         <select id="learn-can-bus">
