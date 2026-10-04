@@ -12,9 +12,154 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Exact PlatformIO version used by the last verified build. The platform
+  # (espressif32@7.1.3) and library versions are pinned in platformio.ini.
+  PIO_CORE_VERSION: "6.2.0"
+
 jobs:
+  # One job per firmware profile, run in parallel. Each job builds its own
+  # firmware (and filesystem image where the profile has one).
   build:
-    name: Build (ESP32-S3 profiles)
+    name: Build ${{ matrix.env }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: esp32-s3-devkitc-1
+            partitions: cartouch_16MB.csv
+            fs: true
+            extra: .pio/build/esp32-s3-devkitc-1/firmware.elf
+          - env: esp32-s3-headless
+            partitions: cartouch_16MB.csv
+            fs: false
+            extra: ""
+          - env: esp32-s3-4mb
+            partitions: cartouch_4MB.csv
+            fs: true
+            extra: ""
+          - env: esp32-s3-4mb-psram
+            partitions: cartouch_4MB.csv
+            fs: true
+            extra: ""
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The toolchain/framework cache only depends on the pinned platform
+      # lines, so editing build flags or libraries does not throw away
+      # ~1 GB of cached packages.
+      - name: Compute cache key
+        id: keys
+        run: |
+          platforms=$(grep -hE '^platform *=' platformio.ini | sort -u | sha256sum | cut -c1-16)
+          echo "pio=pio-build-${RUNNER_OS}-core${PIO_CORE_VERSION}-${platforms}-v1" >> "$GITHUB_OUTPUT"
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: ${{ steps.keys.outputs.pio }}
+
+      # Libraries are pinned, so this cache is exact: it is only reused for
+      # the same platformio.ini.
+      - name: Cache libraries (${{ matrix.env }})
+        uses: actions/cache@v4
+        with:
+          path: .pio/libdeps/${{ matrix.env }}
+          key: libdeps-${{ matrix.env }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: |
+          for attempt in 1 2 3; do
+            if pip install --retries 10 --timeout 60 "platformio==${PIO_CORE_VERSION}"; then
+              exit 0
+            fi
+            echo "::warning::PlatformIO installation failed (attempt $attempt/3); retrying in 20s"
+            sleep 20
+          done
+          echo "::error::PlatformIO installation failed after 3 attempts"
+          exit 1
+
+      - name: Build firmware
+        run: pio run -e ${{ matrix.env }}
+
+      - name: Build filesystem image
+        if: matrix.fs == true
+        run: pio run -e ${{ matrix.env }} -t buildfs
+
+      - name: Validate generated SPIFFS image fits partition
+        if: matrix.fs == true
+        run: python3 scripts/check_spiffs_image.py ${{ matrix.partitions }} .pio/build/${{ matrix.env }}/spiffs.bin
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: fw-${{ matrix.env }}
+          path: |
+            .pio/build/${{ matrix.env }}/firmware.bin
+            .pio/build/${{ matrix.env }}/bootloader.bin
+            .pio/build/${{ matrix.env }}/partitions.bin
+            .pio/build/${{ matrix.env }}/spiffs.bin
+            ${{ matrix.extra }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # Collects the four builds into the same single download as before
+  # (cartouch-firmware: one folder per profile) and checks OTA slot space.
+  bundle:
+    name: Collect firmware and check OTA slot size
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build outputs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fw-*
+          path: parts
+
+      - name: Assemble bundle
+        run: |
+          mkdir -p bundle
+          for dir in parts/fw-*; do
+            name="${dir#parts/fw-}"
+            mkdir -p "bundle/${name}"
+            cp -a "${dir}/." "bundle/${name}/"
+          done
+          find bundle -type f | sort
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cartouch-firmware
+          path: bundle
+          if-no-files-found: error
+          retention-days: 30
+
+      # Runs after the upload so the images are kept even if a slot is too small.
+      - name: Firmware size vs OTA slot
+        run: python3 scripts/check_fw_size.py 8192 bundle --strict
+
+  # Source checks, static analysis and unit tests. Quick checks that need no
+  # PlatformIO run first so a simple mistake fails within seconds.
+  checks:
+    name: Source checks, static analysis and unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -26,35 +171,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Cache PlatformIO
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.platformio
-            ~/.cache/pip
-          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
-          restore-keys: |
-            pio-${{ runner.os }}-
-
-      - name: Install PlatformIO
-        run: |
-          for attempt in 1 2 3; do
-            if pip install --retries 10 --timeout 60 "platformio>=6.1,<7"; then
-              exit 0
-            fi
-            echo "::warning::PlatformIO installation failed (attempt $attempt/3); retrying in 20s"
-            sleep 20
-          done
-          echo "::error::PlatformIO installation failed after 3 attempts"
-          exit 1
-
-      - name: Build firmware
-        run: |
-          pio run -e esp32-s3-devkitc-1
-          pio run -e esp32-s3-headless
-          pio run -e esp32-s3-4mb
-          pio run -e esp32-s3-4mb-psram
 
       - name: Validate SPIFFS path lengths
         run: |
@@ -94,24 +210,48 @@ jobs:
           print("Operator UI language check passed")
           PY
 
-      - name: Firmware size vs OTA slot
-        run: python3 scripts/check_fw_size.py 8192
-
-      - name: Build filesystem image
-        run: |
-          pio run -e esp32-s3-devkitc-1 -t buildfs
-          pio run -e esp32-s3-4mb -t buildfs
-          pio run -e esp32-s3-4mb-psram -t buildfs
-
       - name: Verify only approved modules transmit on CAN
         run: python3 scripts/check_tx_paths.py src
 
       - name: Audit DBC files (duplicates, duplicate ids)
         run: python3 scripts/audit_dbc.py
 
-      - name: Verify MCP2515 8 MHz bit-timing table
-        continue-on-error: true
-        run: python3 scripts/check_mcp_timing.py
+      - name: Compute cache key
+        id: keys
+        run: |
+          platforms=$(grep -hE '^platform *=' platformio.ini | sort -u | sha256sum | cut -c1-16)
+          echo "pio=pio-checks-${RUNNER_OS}-core${PIO_CORE_VERSION}-${platforms}-v1" >> "$GITHUB_OUTPUT"
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: ${{ steps.keys.outputs.pio }}
+
+      - name: Cache libraries
+        uses: actions/cache@v4
+        with:
+          path: .pio/libdeps
+          key: libdeps-checks-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: |
+          for attempt in 1 2 3; do
+            if pip install --retries 10 --timeout 60 "platformio==${PIO_CORE_VERSION}"; then
+              exit 0
+            fi
+            echo "::warning::PlatformIO installation failed (attempt $attempt/3); retrying in 20s"
+            sleep 20
+          done
+          echo "::error::PlatformIO installation failed after 3 attempts"
+          exit 1
+
+      # Explicit, so later steps (the bit-timing check reads the installed
+      # MCP2515 header) never depend on what `pio check` happens to install.
+      - name: Install project dependencies
+        run: pio pkg install -e esp32-s3-devkitc-1 -e esp32-s3-4mb
 
       - name: Static analysis
         run: pio check -e esp32-s3-devkitc-1 --skip-packages
@@ -119,49 +259,11 @@ jobs:
       - name: Static analysis (4 MB profile)
         run: pio check -e esp32-s3-4mb --skip-packages
 
+      # Reads the header PlatformIO installed above, so it runs after the
+      # static-analysis steps. It passed on the first real run, so it is now
+      # a hard check (no continue-on-error).
+      - name: Verify MCP2515 8 MHz bit-timing table
+        run: python3 scripts/check_mcp_timing.py
+
       - name: Native unit tests
         run: pio test -e native
-
-      - name: Validate generated SPIFFS image fits partition
-        run: |
-          python3 - <<'PY'
-          import csv
-          from pathlib import Path
-          def spiffs_partition_size(path):
-            with Path(path).open(newline="") as stream:
-              for row in csv.reader(stream):
-                if row and row[0].strip() == "spiffs":
-                  return int(row[4].strip(), 0)
-            raise SystemExit(f"spiffs partition not found in {path}")
-
-          images = (
-            ("cartouch_16MB.csv", ".pio/build/esp32-s3-devkitc-1/spiffs.bin"),
-            ("cartouch_4MB.csv", ".pio/build/esp32-s3-4mb/spiffs.bin"),
-            ("cartouch_4MB.csv", ".pio/build/esp32-s3-4mb-psram/spiffs.bin"),
-          )
-          for partition, image_path in images:
-            expected = spiffs_partition_size(partition)
-            image = Path(image_path)
-            if not image.is_file():
-              raise SystemExit(f"SPIFFS image not found: {image}")
-            actual = image.stat().st_size
-            print(f"{partition}: partition {expected} bytes; image {actual} bytes")
-            if actual > expected:
-              raise SystemExit(f"Generated SPIFFS image exceeds {partition}")
-          PY
-
-      - name: Upload firmware artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: cartouch-firmware
-          path: |
-            .pio/build/esp32-s3-devkitc-1/*.bin
-            .pio/build/esp32-s3-devkitc-1/firmware.elf
-            .pio/build/esp32-s3-devkitc-1/spiffs.bin
-            .pio/build/esp32-s3-headless/firmware.bin
-            .pio/build/esp32-s3-4mb/firmware.bin
-            .pio/build/esp32-s3-4mb/spiffs.bin
-            .pio/build/esp32-s3-4mb-psram/firmware.bin
-            .pio/build/esp32-s3-4mb-psram/spiffs.bin
-          if-no-files-found: error
-          retention-days: 30
