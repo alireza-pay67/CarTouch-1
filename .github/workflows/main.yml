@@ -94,6 +94,9 @@ jobs:
           print("Operator UI language check passed")
           PY
 
+      - name: Firmware size vs OTA slot
+        run: python3 scripts/check_fw_size.py 8192
+
       - name: Build filesystem image
         run: |
           pio run -e esp32-s3-devkitc-1 -t buildfs
