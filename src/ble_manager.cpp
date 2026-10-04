@@ -3,6 +3,7 @@
 #include <NimBLEDevice.h>
 #include <Update.h>
 #include "ct_password.h"
+#include "ct_ota_header.h"
 #include "sd_storage.h"
 #include "config.h"
 #include "ct_can_record.h"
@@ -18,6 +19,7 @@ BLECharacteristic* gStatus = nullptr;
 BLECharacteristic* gCommand = nullptr;
 BLECharacteristic* gData = nullptr;
 BLEServer* gServer = nullptr;
+CtOtaHeaderCheck gOtaHeader;    // header collected across BLE writes
 BLEManager* gManager = nullptr;
 }
 
@@ -67,12 +69,19 @@ class BLEManager::DataCallbacks : public NimBLECharacteristicCallbacks {
         std::string value = characteristic->getValue();
         if (value.empty()) return;
 
-        if (gManager->_otaReceived == 0 &&
-            !ctOtaFirmwareHeaderOk(reinterpret_cast<const uint8_t*>(value.data()), value.size())) {
-            gManager->_otaError = true;
-            gManager->_abortOta();
-            gManager->_sendStatus("OTA_BAD_HEADER", info.getConnHandle());
-            return;
+        if (!gOtaHeader.done) {
+            const CtOtaHdrResult hr = ctOtaHeaderFeed(
+                gOtaHeader, reinterpret_cast<const uint8_t*>(value.data()), value.size(),
+                ESP.getFlashChipSize());
+            if (hr != CT_OTA_HDR_OK && hr != CT_OTA_HDR_NEED_MORE) {
+                gManager->_otaError = true;
+                gManager->_abortOta();
+                gManager->_sendStatus(hr == CT_OTA_HDR_WRONG_CHIP    ? "OTA_WRONG_CHIP"
+                                      : hr == CT_OTA_HDR_FLASH_TOO_BIG ? "OTA_WRONG_FLASH_SIZE"
+                                                                       : "OTA_BAD_HEADER",
+                                      info.getConnHandle());
+                return;
+            }
         }
         if (gManager->_otaReceived + value.size() > gManager->_otaExpected) {
             gManager->_otaError = true;
@@ -430,6 +439,7 @@ bool BLEManager::_startOta(uint32_t size, const String& password,
         _abortOta();
     }
 
+    gOtaHeader.reset();
     if (!Update.begin(size, U_FLASH)) {
         _otaError = true;
         Serial.printf("[BLE OTA] Update.begin failed: %s\n", Update.errorString());
@@ -447,6 +457,7 @@ bool BLEManager::_startOta(uint32_t size, const String& password,
 
 void BLEManager::_abortOta() {
     if (Update.isRunning()) Update.abort();
+    gOtaHeader.reset();
     _otaInProgress = false;
     _otaAuthenticated = false;
     _otaExpected = 0;
@@ -459,6 +470,12 @@ bool BLEManager::_finishOta() {
     if (_otaReceived != _otaExpected) {
         Serial.printf("[BLE OTA] Size mismatch: got %u of %u bytes\n",
                       (unsigned)_otaReceived, (unsigned)_otaExpected);
+        _otaError = true;
+        _abortOta();
+        return false;
+    }
+    if (!gOtaHeader.done) {    // image shorter than its own header
+        Serial.println("[BLE OTA] Image too short");
         _otaError = true;
         _abortOta();
         return false;

@@ -21,6 +21,7 @@
 #include <esp_random.h>
 #include <Update.h>
 #include "ct_password.h"
+#include "ct_ota_header.h"
 
 #include "ct_hex_parser.h"
 #include "ct_index_parser.h"
@@ -1063,6 +1064,8 @@ void WebServerManager::update() {
 // □□□□□□□□□□ OTA: file upload
 // ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
 
+static CtOtaHeaderCheck gOtaHeader;    // one upload at a time
+
 void WebServerManager::_handleOtaUpload(AsyncWebServerRequest* request, const String& filename,
                                         size_t index, uint8_t* data, size_t len, bool final) {
     AppConfig* cfg = getConfig();
@@ -1073,6 +1076,7 @@ void WebServerManager::_handleOtaUpload(AsyncWebServerRequest* request, const St
     if (index == 0) {
         _otaError = "";
         _otaBytes = 0;
+        gOtaHeader.reset();
         _otaIsFs  = request->hasParam("type") && request->getParam("type")->value() == "fs";
 
         if (!ctPartitionFitsFlash(ESP.getFlashChipSize(), CT_REQUIRED_FLASH_BYTES)) {
@@ -1117,11 +1121,17 @@ void WebServerManager::_handleOtaUpload(AsyncWebServerRequest* request, const St
 
     if (_otaError.length() > 0) return;
 
-    // First chunk of a firmware image must start with the ESP image magic.
-    if (index == 0 && !_otaIsFs && !ctOtaFirmwareHeaderOk(data, len)) {
-        _otaError = "Not a valid ESP32 firmware image (bad header)";
-        if (Update.isRunning()) Update.abort();
-        return;
+    // The first 24 bytes of a firmware image are the ESP image header: it
+    // must be for the ESP32-S3 and for no more flash than this device has.
+    // Chunks are collected until the header is complete (nothing in the
+    // running slot is touched; the update goes to the inactive slot).
+    if (!_otaIsFs && !gOtaHeader.done) {
+        const CtOtaHdrResult hr = ctOtaHeaderFeed(gOtaHeader, data, len, ESP.getFlashChipSize());
+        if (hr != CT_OTA_HDR_OK && hr != CT_OTA_HDR_NEED_MORE) {
+            _otaError = ctOtaHeaderMessage(hr);
+            if (Update.isRunning()) Update.abort();
+            return;
+        }
     }
 
     if (len > 0) {
@@ -1134,6 +1144,11 @@ void WebServerManager::_handleOtaUpload(AsyncWebServerRequest* request, const St
     }
 
     if (final) {
+        if (!_otaIsFs && !gOtaHeader.done) {
+            _otaError = "Firmware image is too short";
+            if (Update.isRunning()) Update.abort();
+            return;
+        }
         if (!Update.end(true)) {
             _otaError = String("Update finalization failed: ") + Update.errorString();
         } else {
