@@ -9,6 +9,7 @@
 #include "ct_dbc_validation.h"
 #include "ct_verify.h"
 #include "ct_password.h"
+#include "ct_ota_header.h"
 #include "ct_storage_policy.h"
 #include "ct_buttons.h"
 #include "ct_json_validation.h"
@@ -800,6 +801,69 @@ void test_buttons_invalid_reading_creates_no_event(void) {
     TEST_ASSERT_EQUAL_INT(CT_KEY_NONE, s.stable);
 }
 
+// ---- OTA image header (chip + flash size) ----
+static void makeOtaHeader(uint8_t* h, uint8_t segments, uint8_t flashCode, uint16_t chip) {
+    memset(h, 0, CT_OTA_HEADER_LEN);
+    h[0] = 0xE9;
+    h[1] = segments;
+    h[3] = (uint8_t)((flashCode << 4) | 0x0F);    // size code in the high nibble
+    h[12] = (uint8_t)(chip & 0xFF);
+    h[13] = (uint8_t)(chip >> 8);
+}
+
+void test_ota_header_accepts_matching_image() {
+    uint8_t h[CT_OTA_HEADER_LEN];
+    makeOtaHeader(h, 5, 2, CT_OTA_CHIP_ESP32S3);    // built for 4 MB
+    CtOtaHeaderCheck st;
+    TEST_ASSERT_EQUAL(CT_OTA_HDR_OK, ctOtaHeaderFeed(st, h, sizeof(h), 4u * 1048576u));
+    TEST_ASSERT_TRUE(st.done);
+    CtOtaHeaderCheck st2;    // 4 MB image on a 16 MB board is allowed
+    TEST_ASSERT_EQUAL(CT_OTA_HDR_OK, ctOtaHeaderFeed(st2, h, sizeof(h), 16u * 1048576u));
+}
+
+void test_ota_header_rejects_flash_chip_and_magic() {
+    uint8_t h[CT_OTA_HEADER_LEN];
+    CtOtaHeaderCheck st;
+    makeOtaHeader(h, 5, 4, CT_OTA_CHIP_ESP32S3);    // built for 16 MB, device has 4 MB
+    TEST_ASSERT_EQUAL(CT_OTA_HDR_FLASH_TOO_BIG, ctOtaHeaderFeed(st, h, sizeof(h), 4u * 1048576u));
+    TEST_ASSERT_FALSE(st.done);
+
+    CtOtaHeaderCheck st2;
+    makeOtaHeader(h, 5, 2, 0x0000);    // original ESP32
+    TEST_ASSERT_EQUAL(CT_OTA_HDR_WRONG_CHIP, ctOtaHeaderFeed(st2, h, sizeof(h), 4u * 1048576u));
+
+    CtOtaHeaderCheck st3;
+    makeOtaHeader(h, 0, 2, CT_OTA_CHIP_ESP32S3);
+    TEST_ASSERT_EQUAL(CT_OTA_HDR_BAD_SEGMENTS, ctOtaHeaderFeed(st3, h, sizeof(h), 4u * 1048576u));
+    makeOtaHeader(h, 17, 2, CT_OTA_CHIP_ESP32S3);
+    CtOtaHeaderCheck st4;
+    TEST_ASSERT_EQUAL(CT_OTA_HDR_BAD_SEGMENTS, ctOtaHeaderFeed(st4, h, sizeof(h), 4u * 1048576u));
+
+    CtOtaHeaderCheck st5;    // unknown size code
+    makeOtaHeader(h, 5, 9, CT_OTA_CHIP_ESP32S3);
+    TEST_ASSERT_EQUAL(CT_OTA_HDR_FLASH_TOO_BIG, ctOtaHeaderFeed(st5, h, sizeof(h), 16u * 1048576u));
+
+    CtOtaHeaderCheck st6;    // wrong first byte is refused at once, before 24 bytes arrive
+    const uint8_t junk[2] = {0x00, 0x01};
+    TEST_ASSERT_EQUAL(CT_OTA_HDR_BAD_MAGIC, ctOtaHeaderFeed(st6, junk, sizeof(junk), 4u * 1048576u));
+}
+
+void test_ota_header_collects_across_small_chunks() {
+    uint8_t h[CT_OTA_HEADER_LEN];
+    makeOtaHeader(h, 5, 2, CT_OTA_CHIP_ESP32S3);
+    CtOtaHeaderCheck st;
+    for (size_t i = 0; i + 1 < sizeof(h); i++) {    // one byte at a time
+        TEST_ASSERT_EQUAL(CT_OTA_HDR_NEED_MORE, ctOtaHeaderFeed(st, h + i, 1, 4u * 1048576u));
+    }
+    TEST_ASSERT_FALSE(st.done);    // image that ends here is too short
+    TEST_ASSERT_EQUAL(CT_OTA_HDR_OK, ctOtaHeaderFeed(st, h + sizeof(h) - 1, 1, 4u * 1048576u));
+    TEST_ASSERT_TRUE(st.done);
+    st.reset();
+    TEST_ASSERT_FALSE(st.done);
+    TEST_ASSERT_EQUAL(0, st.have);
+    TEST_ASSERT_EQUAL(CT_OTA_HDR_NEED_MORE, ctOtaHeaderFeed(st, NULL, 0, 4u * 1048576u));
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_tx_guard_listen_only);
@@ -859,5 +923,8 @@ int main(int, char**) {
     RUN_TEST(test_buttons_adc_classification_and_invalid_range);
     RUN_TEST(test_buttons_debounce_short_and_long_press);
     RUN_TEST(test_buttons_invalid_reading_creates_no_event);
+    RUN_TEST(test_ota_header_accepts_matching_image);
+    RUN_TEST(test_ota_header_rejects_flash_chip_and_magic);
+    RUN_TEST(test_ota_header_collects_across_small_chunks);
     return UNITY_END();
 }
