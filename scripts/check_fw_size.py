@@ -3,9 +3,18 @@
 the free space in the slot gets too small.
 
 OTA needs the new image to fit in one app slot, so the free space is the
-real limit for adding features. Usage:
-    python3 scripts/check_fw_size.py [min_free_bytes]
+real limit for adding features.
+
+Usage:
+    python3 scripts/check_fw_size.py [MIN_FREE_BYTES] [BUILD_DIR] [--strict]
+
+  MIN_FREE_BYTES  smallest allowed free space in a slot (default 8192)
+  BUILD_DIR       folder holding <environment>/firmware.bin
+                  (default .pio/build; CI passes the assembled bundle)
+  --strict        an environment without a firmware.bin is an error
+                  (CI uses this so a missing build can never pass silently)
 """
+import argparse
 import csv
 import sys
 from pathlib import Path
@@ -27,22 +36,32 @@ def app_slot(csv_path):
 
 
 def main():
-    min_free = int(sys.argv[1]) if len(sys.argv) > 1 else 8192
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("min_free", nargs="?", type=int, default=8192)
+    parser.add_argument("build_dir", nargs="?", default=".pio/build")
+    parser.add_argument("--strict", action="store_true")
+    args = parser.parse_args()
+
     failed = False
     print(f"{'environment':22} {'firmware':>10} {'slot':>10} {'free':>9}")
     for env, table in ENVS:
-        image = Path(".pio/build") / env / "firmware.bin"
+        image = Path(args.build_dir) / env / "firmware.bin"
         if not image.is_file():
-            print(f"{env:22} (not built)")
+            if args.strict:
+                print(f"{env:22} MISSING: {image}")
+                failed = True
+            else:
+                print(f"{env:22} (not built)")
             continue
         size, slot = image.stat().st_size, app_slot(table)
         free = slot - size
         flag = ""
-        if free < min_free:
+        if free < 0 or free < args.min_free:
             flag, failed = "  <-- TOO SMALL", True
         print(f"{env:22} {size:>10} {slot:>10} {free:>9}{flag}")
     if failed:
-        print(f"Free space in an OTA slot is below {min_free} bytes.")
+        print(f"Check failed: a firmware is missing or an OTA slot has less than "
+              f"{args.min_free} bytes free.")
         return 1
     return 0
 
