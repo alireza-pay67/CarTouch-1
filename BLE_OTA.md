@@ -44,4 +44,5 @@ The authenticated Web UI remains the full configuration surface.
 - Command/Data characteristics require an encrypted (paired) link.
 - OTA is refused while the default web password is still in use (`OTA_CHANGE_DEFAULT_PASSWORD`).
 - 5 wrong passwords lock BLE OTA for 60 seconds.
+- The image header is checked while data arrives: `OTA_BAD_HEADER` (not an ESP image), `OTA_WRONG_CHIP` (not built for the ESP32-S3) and `OTA_WRONG_FLASH_SIZE` (built for more flash than the device has, for example a 16 MB image sent to a 4 MB board). The transfer is aborted and the running firmware is untouched.
 - Pairing uses Just Works (no passkey, no MITM protection). The link is encrypted, but an attacker present during first pairing could impersonate the device or the phone and capture the OTA password. Pair only in a trusted place, and change the Web password if pairing may have been observed.
