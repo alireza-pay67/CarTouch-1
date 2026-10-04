@@ -30,7 +30,7 @@ private:
     int8_t _adcPin = -1;
     uint16_t _ladder[5] = {0, 0, 0, 0, 0};
     CtKeyState _state;
-    CtKeyEvent _queue[8];
+    CtKeyEvent _queue[8] = {};
     uint8_t _qHead = 0, _qCount = 0;
     bool _everPressed = false;
     uint32_t _invalid = 0;
